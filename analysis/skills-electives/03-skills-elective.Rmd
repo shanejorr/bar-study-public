@@ -1,0 +1,398 @@
+# Skills Electives and Bar Passage
+
+```{r skills_setup}
+
+library(rstanarm)
+library(tidybayes)
+library(modelr)
+library(glue)
+library(knitr)
+library(MatchIt)
+library(bayestestR)
+library(tidyverse)
+
+# use dplyr select instead of MASS select
+select <- dplyr::select
+
+options(mc.cores = parallel::detectCores())
+
+# import custom functions for file
+source('analysis/analysis_functions.R')
+```
+
+```{r skills_import_data}
+# import data --------------------------------- 
+df <- import_skills_data("analysis/skills-electives/data/skills-elective_raw.csv")
+
+# class years where MLA and PT were offered
+mla_years <- c('2017-D', '2018', '2019')
+mpt_years <- c('2018', '2019')
+```
+
+Elon Law offers four bar exam skills-related electives: Multistate Bar Exam (MBE), Multistate Performance Test (MPT), Multistate Essay Exam (MEE) / NC Essays, and Mastering Legal Analysis (MLA). This section refers to MEE and NC Essays as Essays.^[Elon changed the name of NC Essays to MEE starting with the class of 2018 to align with North Carolina's switch to the UBE. This analysis treats the two classes as one course called "Essays".] MLA is required, in part, for some students. Elon required students in the class of 2018 with 1L GPAs under 2.67 to take either MLA or a tutoring program called Learning Excellence Applied Personally (LEAP). In the class of 2019, all students with 1L GPAs under 2.67 had to take MLA.^[Because of this, MLA takers are overrepresented at the bottom end of LGPA distribution. We account for this in section \@ref(skillsModelsHeader) by first matching MLA takers and non-takers on class percentile rank quantile and then accounting for LGPA in a regression model.] This section examines whether students taking a given skills elective perform better on the bar exam than students not taking the elective, after accounting for factors impacting bar performance.
+
+## Overview of the data
+
+We incorporate course information and bar results for all bar takers from the class of 2014, when the electives were first offered, to the class of 2019. Only North Carolina bar takers are analyzed for Essays, while takers from all jurisdictions are evaluated in MBE, MPT, and MLA.
+
+### Percentage of bar takers who took each elective
+
+Table \@ref(tab:SillsElTabPercTook) shows the percentage of bar takers who took each elective. No bar takers took MPT from the class of 2019, even though it was offered. With only one year of data for MPT, we are unlikely to have enough data to draw firm conclusions.
+
+\newpage
+
+```{r SillsElTabPercTook}
+map_names <- c(`essays` = "Essays (NC Only)",   
+               `mbe` = "MBE",
+               `mbeNC` = "MBE (NC Only)",
+               `mpt` = "MPT",
+               `mla` = "MLA")
+
+# get the years where mla and mpt were not offered
+mla_no_years <- setdiff(df$class, mla_years)
+mpt_no_years <- setdiff(df$class, mpt_years)
+
+# calculate percent took each class by year
+perc_by_class <- df %>%
+  group_by(class) %>%
+  summarize_at(vars(essays:mla), ~round(mean(., na.rm = T), 2)) %>%
+  mutate_at(vars(essays:mla), ~glue("{. * 100}%")) %>%
+  # convert to blank in years where class was not offered for two classes
+  mutate(mpt = ifelse(class %in% mpt_no_years, '', mpt),
+         mla = ifelse(class %in% mla_no_years, '', mla))
+
+# calculate overall percent who took each class
+perc_by_overall <- df %>%
+  # convert to NA in years where class was not offered, 
+  # so people who did not take class those years are not included in calculations
+  mutate(mpt = ifelse(class %in% mpt_no_years, NA, mpt),
+         mla = ifelse(class %in% mla_no_years, NA, mla)) %>%
+  summarize_at(vars(essays:mla), ~round(mean(., na.rm = T), 2)) %>%
+  mutate_at(vars(essays:mla), ~glue("{. * 100}%")) %>%
+  mutate(class = "Overall")
+
+bind_rows(perc_by_class, perc_by_overall) %>%
+  kable(col.names = c("Graduating Class", "Essays", "MBE", "MPT", "MLA"), longtable = T, booktabs = T, linesep = "", 
+        caption = "Percentage of bar takers who took each skills elective, by graduating class.")
+```
+
+### Differences in class percentile ranks between those who did and did not take electives
+
+Figure \@ref(fig:SkillsPercClassRank) displays the average law school percentile class rank for students taking and not taking electives. Students taking skills electives generally have lower class ranks than those not taking them. The only exception is MPT. MLA has the largest difference, which is not surprising since it is required, in part, for low-GPA students. 
+
+```{r SkillsPercClassRank, fig.cap = "Avg. law school class percentile rank for students taking and not taking skills electives.", fig.height = 2.5, fig.width = 4.5}
+
+# class_cols
+class_cols <- c('essays', 'mbe', 'mpt', 'mla', 'mbeNC')
+
+# create function that returns the dataset for the given years and states, based on the class
+# needed for calculating average percent ranks and bar passage rates
+create_class_dataset <- function(df, school_class) {
+
+  if (school_class == "mpt") {
+    df %>%
+      # only use first year, because no students took class in second year
+      filter(class %in% mpt_years[1])
+  } else if (school_class %in% c('essays', 'mbeNC')) {
+    df %>%
+      filter(str_detect(jur, "NC"))
+  } else if (school_class == "mla") {
+    df %>%
+      filter(class %in% !!mla_years)
+  } else {
+    df
+  }
+}
+
+class_perc_rank <- function(df, school_class) {
+  
+  create_class_dataset(df, school_class) %>%
+    group_by_at(school_class) %>%
+    summarise(perc_rank = mean(perc_rank, na.rm = T)) %>%
+    rename(took_class = !!school_class) %>%
+    mutate(class = !!school_class) %>%
+    ungroup()
+    
+}
+
+class_grade_comparison <- map_df(class_cols, class_perc_rank, df = df) %>%
+  mutate(took_class = recode(took_class, `0` = "Did not take class", `1` = "Took class"),
+         class = recode(class, !!!map_names)) %>%
+  select(class, everything())
+
+# order for classes on y axis in plot
+class_sort_order <- rev(c('MBE', 'MBE (NC Only)', 'Essays (NC Only)', 'MPT', 'MLA'))
+
+plot_took_class(class_grade_comparison, perc_rank, class, took_class,
+                "Skills elective percentile rank", c(.3, .7), 
+                "Avg. Perc. Class Rank by Elective",
+                class_sort_order)
+```
+
+### Bar passage rates for elective takers and non-takers {#skillsPassRate}
+
+Difference in bar passage rates between elective takers and non-takers is not a good metric to gauge a skills elective's impact on bar performance. This is because skills elective takers have lower average class percentile ranks in all electives except MPT and class percentile rank correlates with bar passage. It can help anchor the issue, however.
+
+Figure \@ref(fig:SkillsPassRate) shows the first-time bar passage rate in North Carolina for elective takers and non-takers. Students taking the electives performed worse on the bar exam for all courses. This could be explained, however, by differences in law school class ranks. For example, MPT has the smallest difference in class ranks and also exhibits the smallest difference in pass rates. MLA, conversely, has the largest difference in both class ranks and bar passage.
+
+```{r SkillsPassRate, fig.cap = "First-time bar passage rates in NC among skills elective takers and non-takers.", fig.height = 2.5, fig.width = 4.5}
+# function that calculates class's bar passage
+class_bar_pass <- function(df, class) {
+  
+ create_class_dataset(df, class) %>%
+    group_by_at(class) %>%
+    summarize(result = mean(result, na.rm = T)) %>%
+    rename("pass" = class) %>%
+    mutate(class = !!class)
+  
+}
+
+# iterate through all classes, calculating bar passage
+class_passage <- map_df(class_cols, class_bar_pass, df = df[str_detect(df$jur, "NC"),]) %>%
+  mutate(class = recode(class, !!!map_names),
+         pass = recode(pass, `0` = "Did not take class", `1` = "Took class"))
+
+plot_took_class(class_passage, result, class, pass,
+                "Bar passage rate", c(.2, 1),
+                "Bar Passage Rate by Elective", 
+                class_sort_order)
+```
+
+## Modeled differences in bar passage rates between skills elective takers and non-takers {#skillsModelsHeader}
+
+We will now model the relationship between taking skills electives and bar passage to better account for student differences such as LGPA. This will bring us closer to uncovering the effect of taking each skills elective on bar passage. The analysis will occur in the same two steps outlined in section \@ref(modelingSteps). The first step creates a new data set by matching each student who did not take a given elective with a similar student who did, with similar defined by class percentile rank and the jurisdiction in which the student took the bar exam.^[We conduct exact matching on class percentile rank by dividing ranks into five quantiles.] This creates a new data set that is more balanced between students who did and did not take the skills elective in class percentile rank and bar jurisdiction.
+
+The next step involves taking the matched data set and creating Bayesian hierarchical logistic regression models for each class. The models measure bar passage while accounting for the student's LGPA, graduating class, bar jurisdiction, and whether she or he took the elective class.^[We created models for each skills elective. Bar passage is the response variable in all models. The models also share standardized LGPA (standardized based on graduating class) as an individual-level predictor and bar jurisdiction and graduating class as group-level predictors. The class models differ in that an additional individual-level predictor is included signifying whether the student took the given elective course.]
+
+### Differences in bar passage rates between elective takers and non-takers with matched data
+
+Results from the first step - matching students who took an elective with like students who did not - are in figure \@ref(fig:SkillsMatchedDiff). It represents the difference in bar passage rates between students who did and did not take the elective, based on the matched data. All electives saw their difference shrink compared to the raw pass rates, or become positive in the case of Essays. This tells us that much of the difference in pass rates is because of differences in class percentile ranks among elective takers and non-takers. But, MPT and MBE still saw non-takers achieve a 4 percentage point higher pass rate on the bar exam.
+
+```{r}
+
+# number of equal number bins to divide percentile rank into for matching
+num_bins <- 5
+
+df_mod <- df %>%
+  select(-ethnicity, -highest_educ) %>%
+  # cut standardized gpa into equal interval bins and center percent rank
+  mutate(cum_gpa_cut = cut_number(cum_gpa_ctr, num_bins, labels = seq(1, num_bins, 1)))
+
+# create list of parameters to iterate through each class, conduct propensity score matching, and create model ----
+
+# propensity score formulas
+matching_form_mbe <- "mbe ~ cum_gpa_cut + jur"
+matching_form_mpt <- "mpt ~ cum_gpa_cut"
+matching_form_essay <- "essays ~ cum_gpa_cut + class"
+matching_form_mla <- "mla ~ cum_gpa_cut + jur"
+
+matching_form <- c(matching_form_essay, matching_form_mbe, matching_form_essay, 
+                   matching_form_mpt, matching_form_mla)
+
+# dataframes for modeling
+nc_only <- df_mod %>%
+  filter(str_detect(jur, "NC"))
+
+df_mpt <- df_mod %>%
+  # only use first year, because no students took class in second year
+  filter(class %in% mpt_years[1])
+
+df_mla <- df_mod %>%
+  filter(class %in% mla_years)
+
+# list of dataframes and classes to iterate through for popensity matching and model creation
+mod_dataframes <- list(nc_only, df_mod, nc_only, df_mpt, df_mla)
+mod_classes <- str_extract(matching_form, '[a-z]*')
+
+# conduct propensity matching, which is the element number below
+# use negative because this subsets by removing this element
+exclue_int <- -3
+```
+
+```{r SkillsMatchedDiff, fig.cap = "Difference in first-time bar passage rates for skills elective takers and non-takers based on the matched data. Positive numbers show that elective takers perform better.", fig.height = 2, fig.width = 4.7}
+pmap_df(list(mod_dataframes[exclue_int], mod_classes[exclue_int], matching_form[exclue_int]), diff_matched) %>%
+  mutate(class_name = recode(class_name, !!!map_names)) %>%
+  # lollipop plot with pass rate differences in electives between elective takers and non-takers
+  single_group_point_plot(x=pass_diff, y=fct_reorder(class_name, pass_diff), 
+                        plot_title='Diff. in Bar Pass Rates by Skills Elective', 
+                        x_label = 'Pass rate for elective takers minus rate for non-takers', 
+                        perc_label=F, x_offset = 1.5) +
+    xlim(c(-7, 7)) +
+    geom_vline(xintercept = 0)
+```
+
+### Log-odds ratio of bar passage comparing elective takers and non-takers
+
+We can further account for differences between students who did and did not take an elective by analyzing the matched data with a Bayesian hierarchical logistic regression model. This is step two. Figure \@ref(fig:SkillsMainRegCoef) shows the regression coefficient values for the variable in each model signifying whether the student took the given elective. Section \@ref(regressionDefinition) explains what the coefficient values mean. The important point is that positive numbers imply that students taking the elective class are more likely to pass the bar, accounting for LGPA, graduating class year, and bar jurisdiction.
+
+```{r skills_mod_parameters}
+# for non-hierarchical coefficients, assume perc_rank_ctr and state rate are positive, 
+# and assume no prior information about the specific class
+# for specific class, reduce scale to 1 so it acts as a regularization tool, preventing us from
+# making a spurious conclusion about a class
+# this is needed since we will be comparing numerous classes
+coef_prior_state <- normal(location = c(1, 0, .5),
+                            scale = c(2.5, 1, 2.5))
+
+coef_prior <- normal(location = c(1, 0),
+                     scale = c(2.5, 1))
+
+# model formulas
+mod_form_essay <- "result ~ cum_gpa_ctr + essays + (1 | class)"
+mod_form_mbe <- "result ~ cum_gpa_ctr + mbe + state_rate_std + (1 | class) + (1 | jur)"
+mod_form_essays_class <- "result ~ cum_gpa_ctr + essays + (essays || class)"
+mod_form_mpt <- "result ~ cum_gpa_ctr + mpt + (1 | jur)"
+mod_form_mla <- "result ~ cum_gpa_ctr + mla + state_rate_std + (1 | class) + (1 | jur)"
+
+model_form <- c(mod_form_essay, mod_form_mbe, mod_form_essays_class, 
+                mod_form_mpt, mod_form_mla)
+
+# list of coefficients for models
+mod_coefs <- list(coef_prior, coef_prior_state, coef_prior, coef_prior, coef_prior_state)
+```
+
+```{r skills_create_mods, cache = T}
+# complete list of parameters to pass to pmap function
+mod_params <- list(df = mod_dataframes, 
+                   class = mod_classes,
+                   match_formula = matching_form,
+                   model_formula = model_form,
+                   coef_prior = mod_coefs)
+
+# iteratively run each model
+# this creates a list, where each item in the list is a different model
+mods <- pmap(mod_params, matching_class_model, match_method = 'exact')
+```
+
+```{r}
+# extract the class names from the model formulas
+class_mod_names <- str_extract(model_form[exclue_int], "(?<=_gpa_ctr [+] )[a-zA-Z]*")
+
+class_draws <- map2_df(mods[exclue_int], class_mod_names, create_class_draws) %>%
+    mutate(class_name = recode(class_name, !!!map_names))
+```
+
+```{r SkillsMainRegCoef, fig.cap = "Log-odds ratio of bar passage between skills elective takers and non-takers. Positive values signify that elective takers have a higher odds of bar passage.", fig.height = 2.5, fig.width = 4.1}
+coef_plot_x_axis <- "Log-odds ratio of bar passage /\nLogistic regression coefficients"
+coef_plot_title <- "Effect of Skills Electives on Bar Pass"
+
+x_plot_limits <- c(-3.5, 3)
+
+class_coeff_plot(class_draws, coef_plot_title, 
+                 x_label = coef_plot_x_axis,
+                 y_label = "Bar Found. Skills Electives",
+                 axis_order = class_sort_order,
+                 x_limit = x_plot_limits)
+```
+
+The main take-away is that no classes have 95% credible intervals entirely above or below zero. And all classes except MBE have 50% credible intervals that cross zero. The general pattern in the most likely values (dots) and credible intervals is what we might expect if no electives had beyond a de minims impact on bar passage, either positively or negatively. As a result, we cannot make any claims with confidence about whether each skills elective has a positive or negative impact on bar passage.
+
+Table \@ref(tab:SkillsElTabProbPos) shows the probability that each elective's most likely value - the dot - is positive. This is the probability that taking the elective increases the odds of bar passage, accounting for LGPA, bar jurisdiction, and graduating class. None of the electives have high or low enough probabilities to warrant with any confidence that the elective increases or decreases the odds of bar passage.
+
+```{r SkillsElTabProbPos}
+class_draws %>%
+  group_by(class_name) %>%
+  mutate(positive = estimate > 0) %>%
+  # calculate percentage of draws below zero
+  summarize(percentage = sum(positive) / n()) %>%
+  mutate(percentage = make_perc_pretty(percentage),
+         # convert to factor for sorting purposes
+         class_name = factor(class_name, levels = class_sort_order)) %>%
+  arrange(desc(class_name)) %>%
+  kable(col.names = c("Class", "Probability"), longtable = T, booktabs = T, linesep = "",
+        caption = "Probability that skills elective takers have a higher odds of bar passage than non-takers, accounting for predictors of bar passage.")
+```
+
+## Impact of Essays on bar passage by student characteristics
+
+### Bar passage predictions for Essays by graduating class
+
+Essays is the only elective that reveals even slight evidence of having a positive impact on bar passage. To examine whether this relationship differs by year, we evaluate average predicted bar passage rates for Essays takers and non-takers by year.^[The model that creates Essays predictions includes bar passage as the response variable. Standardized LGPA and whether the student took Essays are the individual-level predictors. Bar jurisdiction, graduating class, and graduating class with Essays as an interaction term are the group-level predictors.] Figure \@ref(fig:SkillsPredictions) highlights these values. 
+
+The first take-away is the large overlap in the 90% credible intervals for Essays takers and non-takers. We cannot say with confidence for any years that Essays takers have a higher average probability of bar passage than non-takers. Second, the most likely probabilities - the lines - are very close. Therefore, any positive impact of Essays is most likely small.
+
+```{r}
+year_order <- rev(c('2014', '2015', '2016', '2017', '2017-D', '2018', '2019'))
+
+df_pred <- nc_only %>%
+  data_grid(
+    cum_gpa_ctr = seq(-1, 1, by = .1),
+    class = year_order,
+    essays = c(0,1)
+) %>%
+  mutate(jur = ifelse(class %in% c('2019', '2018'), 'NC_ube', 'NC')) %>%
+  add_fitted_draws(mods[[abs(exclue_int)]], n=300, seed = 9384) %>%
+  mutate(perc_rank = round(pnorm(cum_gpa_ctr, 0, 1), 3)) %>%
+  ungroup() %>%
+  group_by(perc_rank, essays, class) %>%
+  median_hdci(.value, width = .9)
+```
+
+```{r SkillsPredictions, fig.cap = "Average probability of bar passage by year for Essays takers and non-takers.", fig.height = 5, fig.width = 8}
+plot_title <- "Probability of bar passage on NC bar exam given Essays and Law Perc. Rank"
+                             
+df_pred %>%
+  ungroup() %>%
+  rename(.lower = .value.lower, .upper = .value.upper) %>%
+  mutate(essays = recode(essays, !!!c(`0` = "Did Not Take Essays", `1` = "Took Essays")),
+         class = factor(class, levels = year_order)) %>%
+  arrange(class) %>%
+  plot_predictions(x_var = perc_rank, class_name = essays, x_axis_limit = c(.25, .75), plot_title = plot_title) +
+  facet_wrap(~class, ncol = 4)
+```
+
+### Log-odds ratio of bar passage comparing Essays takers and non-takers, by race
+
+```{r}
+# create dataset for race
+race_df <- df %>%
+  # cut standardized gpa into equal interval bins and center percent rank
+  mutate(cum_gpa_cut = cut_number(cum_gpa_ctr, num_bins, labels = seq(1, num_bins, 1))) %>%
+  filter(ethnicity %in% c("BA", "CW"),
+         str_detect(jur, "NC")) %>%
+  mutate(ethnicity_cat = ifelse(ethnicity == 'CW', 'White', 'Black')) %>%
+  select(result, ethnicity_cat, class, cum_gpa_ctr, cum_gpa_cut, essays) %>%
+  drop_na()
+```
+
+```{r essays_race_interaction, cache = T}
+race_form_match <- "essays ~ ethnicity_cat + cum_gpa_cut"
+
+race_mod_form <- "result ~ cum_gpa_ctr + essays*ethnicity_cat + (1 | class)"
+
+race_prior <- normal(location = c(1, 0, 0, 0), scale = c(2.5, 1, 2.5, 1))
+
+race_mod <- matching_class_model(race_df, 'essays', race_form_match, 'exact', race_mod_form, race_prior)
+```
+
+```{r}
+# probability that minority effect of Essays is larger than majority effect
+race_direction <- p_direction(race_mod, parameters = 'essays:ethnicity_catWhite')[[2]]
+race_direction <- round(race_direction, 2) * 100
+race_direction <- glue("{race_direction}%")
+
+# extract race posteriors
+race_posterior <- race_mod %>%
+  spread_draws(`essays`, `essays:ethnicity_catWhite`) %>%
+  mutate(White = essays + `essays:ethnicity_catWhite`) %>%
+  select(Black = essays, White)
+```
+
+To further examine Essay's relationship with bar passage, we now examine whether the course's association differs by race.^[To examine whether there are differences by race, we first matched the data on race and law school percentile class rank, with rank divided into five quantiles. Then, we created a Bayesian hierarchical regression model with the following predictors: LGPA standardized by graduating class, a main effect term for race, a main effect term for Essays, an interaction term between race and Essays, and graduating class and bar jurisdiction as a group-level predictors.] Figure \@ref(fig:SkillsRegCoefRace) shows the log-odds ratio of bar passage between Essays takers and non-takers for Black and White students.^[Blacks are labeled as one, while Whites are zero. Therefore, the Black coefficient is the Essays main effect plus the Essays / Black interaction term. The White value is simply the Essays main effect.]
+
+```{r SkillsRegCoefRace, fig.cap = "Log-odds ratio of bar passage between Essays takers and non-takers for Black and White students. Positive values signify taking Essays increases the odds of bar passage.", fig.height = 2, fig.width = 3.4}
+race_posterior %>%
+  pivot_longer(cols = everything(), names_to = 'class_name', values_to = 'estimate') %>%
+  class_coeff_plot(str_c("Effect of Essays on Bar Passage, By Race"), 
+                 x_label = coef_plot_x_axis,
+                 y_label = "Race",
+                 axis_order = rev(c('Black', 'White')),
+                 x_limit = x_plot_limits)
+
+```
+
+There is very slight evidence of differing effects of taking Essays by race. Figure \@ref(fig:SkillsRegCoefRace) shows that the log-odds ratio is slightly higher for Blacks. But, there is only a `r race_direction` probability that the ratio for Blacks is higher. Such a probability prevents us from saying with confidence that the Essays and bar passage relationship is stronger for Blacks.
+
+## Conclusion
+
+There is little evidence that skills electives impact bar performance. We cannot confidently say for any skills electives that elective takers perform either better or worse on the bar exam than non-takers after accounting for LGPA, graduating class, and bar jurisdiction. Taking all classes together, the difference in bar performance, measured by the log-odds ratio, bounces around zero. This is consistent with the idea that skills electives do not impact bar performance and any measured difference is randomness in the data.

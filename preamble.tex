@@ -1,0 +1,55 @@
+\usepackage{booktabs}
+\usepackage{longtable}
+%\pagestyle{plain}
+\raggedbottom 
+% first level headers say 'Section' instead of 'Chapter'
+\AtBeginDocument{\renewcommand{\chaptername}{Section}}
+
+% prevent footnotes from renumbers at the start of each chapter
+\usepackage{chngcntr}
+\counterwithout{footnote}{chapter}
+
+% convert footnotes to endnoted
+\usepackage{endnotes}
+\renewcommand*{\enoteheading}{} % remove 'Notes' above endnotes
+\let\footnote=\endnote
+% note: also need to add the following at the end of the final document 
+%\theendnotes
+%\newpage
+
+% style headers
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\renewcommand{\chaptermark}[1]{\markboth{#1}{#1}}
+\fancyhead[R]{}
+\fancyhead[L]{\chaptername\ \thechapter\ --\ \leftmark}
+
+% indent first endnote
+\usepackage{etoolbox}
+\patchcmd{\enoteformat}{1.8em}{0pt}{}{}
+
+% remove headfirstr from introduction
+%\newcommand{\uchapter}[1]{%
+%  \chapter*{#1}%
+%  \markboth{#1}{}%
+%  \addcontentsline{toc}{chapter}{#1}%
+%}
+
+% remove headers from empty pages
+\usepackage{emptypage}
+
+% remove headers from table of contents
+\makeatletter \def\cleardoublepage{\clearpage\if@twoside
+\ifodd\c@page\else \hbox{} \vspace*{\fill}
+\thispagestyle{empty} \newpage
+\if@twocolumn\hbox{}\newpage\fi\fi\fi} \makeatother
+
+% don't let figures and tables float
+\usepackage{float}
+\let\origfigure\figure
+\let\endorigfigure\endfigure
+\renewenvironment{figure}[1][2] {
+    \expandafter\origfigure\expandafter[H]
+} {
+    \endorigfigure
+}

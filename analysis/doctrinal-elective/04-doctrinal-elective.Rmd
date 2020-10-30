@@ -1,0 +1,418 @@
+# Doctrinal Electives and Bar Passage
+
+```{r doc_el_setup, include=FALSE}
+
+library(rstanarm)
+library(tidybayes)
+library(modelr)
+library(glue)
+library(knitr)
+library(MatchIt)
+library(bayestestR)
+library(tidyverse)
+
+# use dplyr select instead of MASS select
+select <- dplyr::select
+
+options(mc.cores = parallel::detectCores())
+
+# import custom functions for file
+source('analysis/analysis_functions.R')
+```
+
+```{r doc_el_import_data}
+# import data ---------------------------------
+
+df <- read_csv("analysis/doctrinal-elective/data/doctrinal-elective_raw.csv") %>%
+  # make missing state rate value (there is only one) 0, which is average
+  replace_na(list(state_rate_std = 0)) %>%
+  # convert Dec. classes before 2017 to the class the students entered with
+  mutate(class = str_replace(class, "2016-D", "2017"),
+         class = str_replace(class, "2015-D", "2016")) %>%
+  # convert class grades to either 0 if missing value (did not take class)
+  # or 1 if a grade is present (took class)
+  mutate_at(vars(conf_laws:will_trust), ~as.character(.)) %>%
+  mutate_at(vars(conf_laws:will_trust), ~replace_na(., "Did not take")) %>%
+  mutate_at(vars(conf_laws:will_trust), ~ifelse(. == "Did not take", 0, 1)) %>%
+  mutate_at(vars(conf_laws:will_trust), ~as.numeric(.)) %>%
+  # standardize cumulative GPA
+  group_by(class) %>%
+  mutate(cum_gpa_ctr = scale(cum_gpa)) %>%
+  ungroup() %>%
+  # make Feb 19 NC bar takers and later their own jurisdiction since this is when NC transitioned to
+  # UBE and bar rates went up a lot
+  mutate(jur = ifelse((date %in% c("19F", "19J", "20F"))  & (jur == "NC"), "NC_ube", jur)) %>%
+  # remove conflict of laws because we only have one year of data
+  select(-conf_laws)
+```
+
+Elon Law offers electives courses in six bar-related doctrinal subjects: Criminal Procedure, Family Law, Remedies, Sales, Secured Transactions, and Wills and Trust. This section examines whether students who take skills electives perform better on the bar exam, accounting for predictors of bar passage. We use course information and bar results for all bar takers from the class of 2010 to the class of 2019 to answer this question. All the doctrinal courses studied are electives in the course catalog. But starting with the class of 2020, the last class analyzed in this report, Elon required students with GPAs under 2.67 after their Winter 1L term to take Criminal Procedure, Secured Transactions, and one of either Family Law or Wills and Trusts.
+
+## Overview of the data
+
+### Percentage of bar takers who took each elective
+
+Two challenges emerge when studying the impact of taking doctrinal electives on bar passage. First, many of the electives have high participation rates. In analyzing differences in bar passage rates, the sample size is constrained by the number of students in the smallest category. So when most students take a class we have few data points to draw from in the 'did not take the class' category. This makes it difficult to draw conclusions from comparisons between elective takers and non-takers. Highlighting this challenge, table \@ref(tab:DocElPercTook) lists the percentage of eventual bar takers who took each of the given electives. Criminal Procedure, Secured Transactions, and Wills and Trust experienced participation rates over 75%.
+
+Further, all bar takers took Criminal Procedure for the classes of 2010 to 2013 and Wills and Trusts had full participation for the class of 2011. Since all bar takers took these courses for the given graduating class, there is no group of non-takers to contrast these students against. This makes it impossible to analyze differences in pass rates between elective takers and non-takers within these graduating classes and elective combinations. Therefore, we removed the classes of 2010 to 2013 in subsequent analyses of Criminal Procedure and the class of 2011 for Wills and Trusts.
+
+```{r DocElPercTook}
+map_names <- c(`crim_pro` = "Crim Pro",   
+               `family` = "Family Law",
+               `remedies` = "Remedies",
+               `sales` = "Sales",
+               `sec_trans` = "Sec. Trans.",
+               `will_trust` = "Wills and Trusts")
+
+# calculate percent took each class by year
+perc_by_class <- df %>%
+  group_by(class) %>%
+  summarize_at(vars(crim_pro:will_trust), ~round(mean(., na.rm = T), 2)) %>%
+  mutate_at(vars(crim_pro:will_trust), ~glue("{. * 100}%"))
+
+# calculate overall percent who took each class
+perc_by_overall <- df %>%
+  summarize_at(vars(crim_pro:will_trust), ~round(mean(., na.rm = T), 2)) %>%
+  mutate_at(vars(crim_pro:will_trust), ~glue("{. * 100}%")) %>%
+  mutate(class = "Overall")
+
+bind_rows(perc_by_class, perc_by_overall) %>%
+  kable(col.names = c("Graduating Class", map_names), longtable = T, booktabs = T,  linesep = "", 
+        caption = "Percentage of bar takers who took each doctrinal elective, by graduating class.")
+```
+
+### Differences in class percentile ranks between those who did and did not take electives
+
+The second challenge in studying bar passage differences by electives is that students taking the class do not have the same characteristics as those not taking the class.  For many electives, students not taking the class have higher average LGPAs than those taking it. Figure \@ref(fig:DocElPercRank) highlights these differences. It shows the average law school class percentile rank for students taking and not taking electives.
+
+```{r DocElPercRank, fig.cap = "Avgerage law school class percentile rank for doctrinal elective takers and non-takers.", fig.height = 2.5, fig.width = 5.5}
+
+# calculate average percentile rank for takers and non-takers of a class
+class_perc_rank <- function(df, school_class, weighted_mean = F) {
+  
+  # for crim pro and wills & trust, all students took the class in the listed years
+  # so, we will remove from analysis
+  if (school_class == 'crim_pro') {
+    df <- df %>%
+      filter(!(class %in% c('2010','2011','2012','2013') ))
+  }
+  
+  if (school_class == 'will_trust') {
+    df <- df %>%
+      filter(class != '2011')
+  }
+  
+  df <- df %>%
+    group_by_at(school_class)
+  
+  if (weighted_mean == F) {
+    df <- df %>%
+      summarise(perc_rank = mean(perc_rank, na.rm = T))
+  } else if (weighted_mean == T) {
+    df <- df %>%
+      summarise(perc_rank = weighted.mean(perc_rank, weights, na.rm = T))
+  } else (
+    stop("weighted_mean must be either TRUE or FALSE")
+  )
+  
+ df %>%
+    rename(took_class = !!school_class) %>%
+    mutate(class = !!school_class) %>%
+    ungroup()
+    
+}
+
+took_class_recode <- c(`yes` = "Took class", `no` = "Did not take class")
+
+class_grade_comparison <- map_df(names(map_names), class_perc_rank, df = df) %>%
+  mutate(took_class = recode(took_class, `0` = "no", `1` = "yes"),
+         class = recode(class, !!!map_names)) %>%
+  select(class, everything()) %>%
+  mutate(took_class = recode(took_class, !!!took_class_recode))
+
+# order for classes on y axis in plot
+class_sort_order <- c('Remedies', 'Sec. Trans.', 'Family Law', 'Crim Pro', 'Sales', 'Wills and Trusts')
+
+# make order match order in previous plot
+class_grade_comparison$class <- factor(class_grade_comparison$class, levels = class_sort_order)
+
+plot_took_class(df = class_grade_comparison, x_value = perc_rank, y_value = class, color_value = took_class,
+                x_label = "Avg. Cumulative Class Percentile Rank", x_limits = c(.3, .7),
+                plot_title = 'Class Perc. Ranks by Elective',
+                y_sorting_order = class_sort_order)
+```
+
+### Bar passage rates for elective takers and non-takers
+
+As in section \@ref(skillsPassRate), we present first-time North Carolina bar passage rates for doctrinal elective takers and non-takers in figure \@ref(fig:DocElPassRate) to frame the issue. However, the modeled results in section \@ref(docModeled) are better indicators of the impact of taking doctrinal electives on bar passage. That said, it is encouraging that students taking Wills and Trust, Sales, Crim Pro, and Family Law achieved higher bar passage rates despite having lower average class percentile ranks than non-takers.
+
+```{r DocElPassRate, fig.cap = "First-time NC bar passage rates for doctrinal elective takers and non-takers.", fig.height = 2.5, fig.width = 5.5}
+# function that calculates class's bar passage
+class_bar_pass <- function(df, class, weighted_mean = F) {
+  
+  # for crim pro and wills & trust, all students took the class in the listed years
+  # so, we will remove from analysis
+  if (class == 'crim_pro') {
+    df <- df %>%
+      filter(!(class %in% c('2010','2011','2012','2013') ))
+  }
+  
+  if (class == 'will_trust') {
+    df <- df %>%
+      filter(class != '2011')
+  }
+  
+  df <- df %>%
+    group_by_at(class)
+  
+  if (weighted_mean == F) {
+    df <- df %>%
+      summarise(result = mean(result, na.rm = T))
+  } else if (weighted_mean == T) {
+    df <- df %>%
+      summarise(result = weighted.mean(result, weights, na.rm = T))
+  } else (
+    stop("weighted_mean must be either TRUE or FALSE")
+  )
+  
+  df %>%
+    rename("pass" = class) %>%
+    mutate(class = !!class)
+}
+# iterate through all classes, calculating bar passage
+class_passage <- map_df(names(map_names), class_bar_pass, df = df[str_detect(df$jur, "NC"),]) %>%
+  mutate(class = recode(class, !!!map_names),
+         pass = recode(pass, `0` = "Did not take class", `1` = "Took class"))
+
+plot_took_class(df = class_passage, x_value = result, y_value = class, color_value = pass,
+                x_label = "Bar Passage Rate", x_limits = c(.35, .9),
+                plot_title = 'NC Bar Passage Rate by Doctrinal Elective',
+                y_sorting_order = class_sort_order)
+```
+
+## Modeled differences in bar passage rates between doctrinal elective takers and non-takers {#docModeled}
+
+Comparing differences in bar passage rates for North Carolina bar takers provides an imprecise gauge because it does not account for law school grades and graduating class. To account for these correlates with bar passage, we model bar passage rates with the two steps outlined in section \@ref(modelingSteps). The first step creates a new data set by matching each student who did not take the elective with a similar student who did, with similar defined by class percentile rank, graduating class, and bar jurisdiction.^[Class percentile rank is matched by separating students into five quantiles based on percentile rank and then matching based on the quantile.] We use bar takers from all jurisdictions within the models.
+
+The next step involves taking the matched data set and creating Bayesian hierarchical logistic regression models for each class. The models measure bar passage while accounting for the student's LGPA, graduating class, bar jurisdiction, and whether the student took the elective class.^[We created six distinct Bayesian hierarchical logistic regression models; one for each elective. The response variable is bar passage for all models. All models have LGPA standardized by graduating class as an individual-level predictor, and graduating class and bar exam jurisdiction as group-level predictors. The models differ in that each model adds an additional predictor represented by 1 if the student took the given elective and 0 if she did not.]
+
+### Differences in bar passage rates between electives takers and non-takers with matched data
+
+Highlighting step one, figure \@ref(fig:DocElPassRateMatched) shows difference in bar passage rates between elective takers and non-takers within the matched data set. These differences improve upon the raw data since they better account for class rank, graduating class, and bar jurisdiction. The plot supports the raw data. Elective takers perform better on the bar than non-takers in four classes, with Wills and Trusts and Sales exhibiting the largest differences.
+
+```{r DocElPassRateMatched, fig.cap = "Difference in first-time bar passage rates for doctrinal elective takers and non-takers based on the matched data set. Positive numbers show that elective takers perform better.", fig.height = 2.75, fig.width = 5.5}
+# number of equal intervals to bin percent rank into for matching
+num_bins <- 5
+
+df_mod <- df %>%
+  # cut standardized gpa into equal interval bins and center percent rank
+  mutate(cum_gpa_cut = cut_number(cum_gpa_ctr, num_bins, labels = seq(1, num_bins, 1))) %>%
+  select(contains('cum_gpa'), class, jur, names(map_names), state_rate_std, result) %>%
+  drop_na()
+
+# create a separate dataset for crim pro and will & trusts by removing years where all students took class
+df_crim_pro <- df_mod %>%
+  filter(!(class %in% c('2010','2011','2012','2013')))
+
+df_will <- df_mod %>%
+  filter(class != '2011')
+
+match_forms <- glue("{names(map_names)} ~ cum_gpa_cut + class + jur")
+list_df_mod <- list(df_crim_pro, df_mod, df_mod, df_mod, df_mod, df_will) 
+
+# parameter to iterate through function that creates matched difference in bar passage
+diff_params <- list(
+  df = list_df_mod, 
+  match_col = names(map_names), 
+  matching_form = match_forms
+)
+
+# create separate matched datasets and then pull out applicable columns and stack into one dataset
+pmap_df(diff_params, diff_matched) %>%
+  mutate(class_name = recode(class_name, !!!map_names)) %>%
+  # lollipop plot with pass rate differences in electives between elective takers and non-takers
+  single_group_point_plot(x=pass_diff, y=fct_reorder(class_name, pass_diff), 
+                          plot_title='Differences in Bar Pass Rates By Doctrinal Elective', 
+                          x_label = 'Bar pass difference in percentage points (takers minus non-takers)', 
+                          perc_label=F, x_offset = 1.5,
+                          sub_label = "Positive numbers signify that elective takers perform better") +
+    xlim(c(-5, 15)) +
+    geom_vline(xintercept = 0)
+```
+
+### Log-odds ratio of bar passage between elective takers and non-takers
+
+```{r doc_el_all_mods, cache = TRUE}
+
+# create parameters for matching and linear models
+main_params <- list(
+  df = list_df_mod,
+  class = names(map_names),
+  match_formula = glue("{names(map_names)} ~ cum_gpa_cut + class"),
+  model_formula = glue("result ~ {names(map_names)} + cum_gpa_ctr + state_rate_std + (1 | class) + (1 | jur)")
+)
+
+main_mod_coef <- normal(c(0, 1, .2), c(1, 2.5, 2.5)) 
+
+# run matching and linear models for each elective class
+mods <- pmap(main_params, matching_class_model, coef_prior = main_mod_coef, match_method = 'exact')
+```
+
+```{r}
+class_draws <- map2_df(mods, names(map_names), create_class_draws) %>%
+    mutate(class_name = recode(class_name, !!!map_names))
+```
+
+Moving to step two, figure \@ref(fig:DocElRegCoef) shows the log-odds ratios between taking and not taking a given elective. Positive values signify that doctrinal elective takers have a higher odds of bar passage compared to non-takers, accounting for LGPA, graduating class, and bar jurisdiction. Wills and Trusts, Sales, and Family Law have 95% credible intervals above zero. This creates strong evidence that students taking these electives have higher odds of bar passage than those not taking them, even when accounting for LGPA, graduating class, and bar jurisdiction.
+
+```{r DocElRegCoef, fig.cap = "Log-odds ratio of bar passage between doctrinal elective takers and non-takers. Positive values signify that elective takers have higher odds of bar passage than non-takers.", fig.height = 2.75, fig.width = 4}
+coef_plot_x_axis <- "Log-odds ratio of bar passage /\nLogistic regression coefficients"
+coef_plot_title <- "Effect of Doct. Electives on Bar Pass"
+
+# rank median HDI for all classes, which will be used for coef. plot axis order
+main_axis_order <- class_draws %>%
+  group_by(class_name) %>%
+  median_hdi(estimate) %>%
+  arrange(estimate) %>%
+  select(class_name) %>%
+  .[[1]]
+
+x_plot_limit <- c(-2.5, 3)
+
+class_coeff_plot(class_draws, coef_plot_title, 
+                 x_label = coef_plot_x_axis,
+                 y_label = "Doctrinal Elective Courses",
+                 axis_order = main_axis_order,
+                 x_limit = x_plot_limit)
+```
+
+Table \@ref(tab:DocElProbHigher) displays the probability that each elective exhibits a log-odds ratio above zero. This is the probability that taking the elective increases the odds of bar passage.
+
+```{r DocElProbHigher}
+class_draws %>%
+  post_point_prob(class_name, expr(estimate > 0), pretty_output = T) %>%
+  mutate(class_name = factor(class_name, levels = main_axis_order)) %>%
+  arrange(desc(class_name)) %>%
+  kable(col.names = c("Class", "Probability of Positive Impact"), 
+        longtable = T, booktabs = T,  linesep = "", 
+        caption = "Probability that doctrinal elective takers have a higher odds of bar passage than non-takers, accounting for predictors of bar passage.")
+```
+
+The table confirms the plot. Given the probabilities, we can be very confident that Wills and Trusts, Sales, and Family Law have a positive impact on bar passage. Although Secured Transactions and Crim Pro have probabilities above 50%, their probabilities are too low to claim with confidence that they have a positive impact on bar passage.
+
+### Odds ratio of bar passage comparing elective takers and non-takers
+
+Table \@ref(tab:docEloddsRatios) converts the log-odds ratios in \@ref(fig:DocElRegCoef) to odds-ratios.^[We created the  odds-ratios by first exponentiating the elective coefficients for all draws from the posterior distribution. We then calculated the median as the most likely value and the 95% highest posterior density interval.] These can be easier to interpret. Odds-ratios over one mean that elective takers are more likely to pass the bar exam, while values under one tell us that non-takers are more likely to pass the bar exam. An odds-ratio of 1.5, for example, means that elective takers are 1.5 times more likely to pass the bar exam.
+
+```{r docEloddsRatios}
+# \@ref(tab:docEloddsRatios)
+# convert log-odds to odds ratios and display in table
+class_draws %>%
+  mutate(estimate = exp(estimate)) %>%
+  group_by(class_name) %>%
+  median_hdi(estimate) %>%
+  select(class_name, estimate, .lower, .upper) %>%
+  mutate_if(is.numeric, ~round(., 1)) %>%
+  arrange(desc(estimate)) %>%
+  kable(col.names = c("Class", "Estimated odds-ratio", "Lower estimate", "Upper estimate"), 
+        longtable = T, booktabs = T,  linesep = "",
+        caption = "Odds-ratios for elective takers and non-takers. Values over one indicate that elective takers have higher odds of bar passage.")
+
+```
+
+Students taking Wills and Trusts are estimated to be over twice as likely to pass the bar exam compared to similar students who do not take the class, while takers of Sales and Family Law are around one and a half times more likely. The range of estimated odds-ratios for Secured Transactions, Crim Pro, and Remedies span one, so we cannot confidently make claims about these courses' impact on bar passage.
+
+## Impact of Sales on bar passage by student characteristics
+
+Sales has the second highest impact on bar passage. It also contains an even mix of students taking and not taking the course, giving us more data to analyze the course in finer detail. Because of these two factors, we will examine the relationship between taking Sales and bar passage among graduating classes and races. 
+
+### Bar passage predictions for Sales by graduating class
+
+Figure \@ref(fig:DocElPredictions) shows the average probability of bar passage on the North Carolina bar exam for Sales takers and non-takers, by graduating class.^[The predictions come from a model almost identical to the original Bayesian logistic regression model for Sales. But, an additional group-level term was added that interacts graduating class and whether the student took Sales.] Students taking Sales have a higher average predicted bar passage, with the difference ranging from five to ten percentage points. But, there are no clear trends in the yearly differences. The differences in passage rates between takers and non-takers neither increases or decreases through time. 
+
+```{r sales_class_int, cache = TRUE}
+# create interaction mode for sales and class
+sales_int_mod <- matching_class_model(df = df_mod, class = 'sales', 
+                                     match_formula = "sales ~ cum_gpa_cut + class",
+                                     match_method = 'exact', 
+                                     model_formula = "result ~ sales + cum_gpa_ctr + (sales || class) + (1 | jur)", 
+                                     coef_prior = normal(c(0, 1), c(1, 2.5)))
+
+year_order <- rev(sort(unique(df_mod$class)))
+
+df_pred <- df_mod %>%
+  data_grid(
+    cum_gpa_ctr = seq(-1, 1, by = .1),
+    class = year_order,
+    sales = c(0,1),
+) %>%
+  mutate(jur = ifelse(class %in% c('2019', '2018'), 'NC_ube', 'NC')) %>%
+  add_fitted_draws(sales_int_mod, n=300, seed = 9384) %>%
+  mutate(perc_rank = round(pnorm(cum_gpa_ctr, 0, 1), 3)) %>%
+  ungroup() %>%
+  group_by(perc_rank, sales, class) %>%
+  median_hdci(.value, width = .9)
+```
+
+```{r DocElPredictions, fig.cap = "Average probability of bar passage by year for Sales takers and non-takers.", fig.height = 6, fig.width = 8}
+plot_title <- "Probability of bar passage on NC bar exam given Sales and Law School Grades"
+                             
+df_pred %>%
+  ungroup() %>%
+  rename(.lower = .value.lower, .upper = .value.upper) %>%
+  mutate(sales = recode(sales, !!!c(`0` = "Did Not Take Sales", `1` = "Took Sales")),
+         class = factor(class, levels = year_order)) %>%
+  arrange(class) %>%
+  plot_predictions(x_var = perc_rank, class_name = sales, x_axis_limit = c(.25, .75), plot_title = plot_title) +
+  facet_wrap(~class, ncol = 4)
+```
+
+### Log-odds ratio of bar passage between Sales takers and non-takers, by race
+
+```{r doc_el_clean_data, cache = TRUE}
+# create dataset for race
+race_df <- df %>%
+  # cut standardized gpa into equal interval bins and center percent rank
+  mutate(cum_gpa_cut = cut_number(cum_gpa_ctr, num_bins, labels = seq(1, num_bins, 1))) %>%
+  filter(ethnicity %in% c("BA", "CW"),
+         str_detect(jur, "NC")) %>%
+  mutate(ethnicity_cat = ifelse(ethnicity == 'CW', 'White', 'Black')) %>%
+  select(result, ethnicity_cat, class, cum_gpa_ctr, cum_gpa_cut, sales) %>%
+  drop_na()
+```
+
+```{r sales_race_interaction, cache = TRUE}
+race_form_match <- "sales ~ ethnicity_cat + cum_gpa_cut"
+
+race_mod_form <- "result ~ cum_gpa_ctr + sales*ethnicity_cat + (1 | class)"
+
+race_prior <- normal(location = c(1, 0, 0, 0), scale = c(2.5, 1, 2.5, 1))
+
+race_mod <- matching_class_model(race_df, 'sales', race_form_match, 'exact', race_mod_form, race_prior)
+```
+
+```{r}
+# extract race posteriors
+race_posterior <- race_mod %>%
+  spread_draws(`sales`, `sales:ethnicity_catWhite`) %>%
+  mutate(White = sales + `sales:ethnicity_catWhite`) %>%
+  select(Black = sales, White)
+```
+
+Moving to effects by race, figure \@ref(fig:DocElRegCoefRace) shows the log-odds ratio of taking Sales on bar passage for Black and White students.^[To examine whether there are differences by race, we first matched the data on race and law school percentile class rank, with rank divided into five quantiles. Then, we created a Bayesian hierarchical logistic regression model with the following predictors: LGPA standardized by graduating class, a main effect term for race, a main effect term for Sales, an interaction term between race and Sales, and graduating class and jurisdiction as group-level predictors.] The most likely value for Blacks is similar to the value for Whites. Further, the 95% credible interval for Blacks almost fully includes the interval for Whites. As a result, we cannot claim with any confidence that Black students experience a larger or smaller impact of Sales on bar passage.
+
+```{r DocElRegCoefRace, fig.cap = "Log-odds ratio of bar passage between Sales takers and non-takers for Black and White students. Positive values signify taking Sales increases the odds of bar passage.", fig.height = 2, fig.width = 4}
+race_posterior %>%
+  pivot_longer(cols = everything(), names_to = 'class_name', values_to = 'estimate') %>%
+  class_coeff_plot("Effect of Sales on Bar Passage, By Race", 
+                 x_label = coef_plot_x_axis,
+                 y_label = "Race",
+                 axis_order = rev(c('Black', 'White')),
+                 x_limit = x_plot_limit)
+```
+
+The 95% credible intervals for both races cross zero. On the surface, this means that we cannot confidently say that Sales positively impacts bar passage for either race. But as shown in figure \@ref(fig:DocElRegCoef), taking Sales does clearly have a positive impact on bar passage. The apparent contradiction occurs because partitioning the analysis by race widens the credible intervals.
+
+## Conclusion
+
+Three of the six doctrinal electives - Wills and Trusts, Sales, and Family Law - have a positive impact on bar passage. Students taking these courses have a higher odds of bar passage than non-takers, even when accounting for bar passage predictors. We can contrast this against skills electives where no classes clearly have a positive impact on bar passage. These results imply that doctrinal electives, in general, positively impact bar performance better than skills electives.

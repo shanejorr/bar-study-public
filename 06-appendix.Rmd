@@ -1,0 +1,9 @@
+# (APPENDIX) Appendix {-} 
+
+# Software {-#software}
+
+We conducted the analysis with R, version 4.0.3. All models were developed with the R package `rstanarm` and visualizations were created with `ggplot2`. Each section of the report is an Rmarkdown document, which we combined with `bookdown` to create the full report. The code for the Rmarkdown files is available at:  . No data accompanies the code due to student privacy protections.
+
+# Notes {-#notes}
+
+\theendnotes

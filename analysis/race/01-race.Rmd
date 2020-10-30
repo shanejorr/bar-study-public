@@ -1,0 +1,567 @@
+# Race and Bar Passage
+
+```{r RaceSetup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+
+library(rstanarm)
+library(tidybayes)
+library(mediation)
+library(modelr)
+library(glue)
+library(knitr)
+library(MatchIt)
+library(lme4)
+library(bayestestR)
+library(tidyverse)
+
+# use dplyr select instead of MASS select
+select <- dplyr::select
+
+options(mc.cores = parallel::detectCores())
+
+# import master file of custom functions
+source('analysis/analysis_functions.R')
+
+# import race custom functions
+source('analysis/race/race_custom_functions.R')
+```
+
+```{r}
+race <- import_race_data("analysis/race/data/race_raw.csv")
+```
+
+We start by examining the relationship between race and bar passage. Although this section does not directly address the effectiveness of doctrinal and skills courses, it does provide the foundation for subsequent analyses. Bar prep programs should aim to decrease any racial disparities that do exist and only by understanding disparities can we evaluate whether this aim is met. 
+
+The section begins by providing an overview of racial differences in bar passage rates, LGPA, and admissions factors. We then model the association between race and bar passage, while accounting for LGPA. We find that there are minimal direct racial disparities in bar passage once we account for LGPA. 
+
+The analysis subsequently explores race's relationship to LGPA, while accounting for admissions factors. Racial disparities do emerge in LGPA. White students have higher LGPAs than Black students, even when accounting for admissions factors. Finally, we conduct a mediation analysis to quantify race's indirect effect on bar passage through its effect on LGPA. This analysis reveals disparities in bar passage, with White students having a higher probability of bar passage due to race's effect on LGPA.
+
+## Overview of the data
+
+### Number of bar takers by race
+
+For context, we begin with an overview of the bar and race data. Table \@ref(tab:RaceTabNumTakers) identifies the number of first-time bar takers by race among the classes of 2009 to 2019. We collected students' race from their admissions applications, where students self-identify their race. Blacks and Whites make up the vast majority of bar takers and are the only two racial groups with enough students to properly analyze. The other groups do not have enough students to produce reliable estimates. Therefore, our analysis is limited to comparing Black and White bar passage rates.^[Throughout this report, only data from Black and Whites students is used when an analysis is conducted by race.] 
+
+```{r RaceTabNumTakers}
+# table of number of bar takers by race
+race %>%
+  group_by(race) %>%
+  # count total number of bar takers from each race
+  count() %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  # calculate the percentage of bar takers from each race
+  mutate(perc_takers = round(n / sum(n), 2),
+         # make percent number look pretty for table
+         perc_takers = glue("{perc_takers*100}%"),
+         # make the percentages that round to 0 show up as '<1%'
+         perc_takers = ifelse(perc_takers == '0%', '<1%', perc_takers)) %>%
+  kable(col.names = c("Race", "Number of bar takers", "% of all bar takers"), 
+        longtable = T, booktabs = T,  linesep = "",
+        caption = "Number of first-time bar takers by race.")
+```
+
+Focusing on Black and White students, figure \@ref(fig:raceFirstTimeTakers) displays the number of first-time bar takers by graduating class.
+
+```{r raceFirstTimeTakers, fig.cap = "First-time bar takers by graduating class and race.", fig.width = 3.4, fig.height = 3.5}
+# raw data plots -----------------
+
+# remove non-AA and white students because there is insufficient data for other races
+race <- race %>%
+  filter(classification %in% c("White", "Black"))
+
+# x axis label for all plots
+x_lab <- "Graduating class"
+
+# bar takers by race and year
+race %>%
+  group_by(class, classification) %>%
+  count() %>%
+  plot_race_diff(class, n, classification, 
+                 "Number of Bar Takers Per Year", x_lab, "Number of bar takers", FALSE) +
+    scale_y_continuous(limits = c(0, 110))+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+### Bar passage rates by race
+
+The aggregate bar passage rates for all first-time Black and White bar takers is broken down in table \@ref(tab:RaceTabPassRate). Whites have almost a 30% higher aggregate bar passage rate. We will later try to identify what factors lead to these disparities.
+
+```{r RaceTabPassRate}
+race %>%
+  calc_pass_rates(c('classification', 'result'), "classification") %>%
+  select(classification, Pass, Fail, pass_rate) %>%
+  mutate(pass_rate = make_perc_pretty(pass_rate)) %>%
+  kable(col.names = c('Race', 'Pass', 'Fail', 'Pass Rate'), longtable = T, booktabs = T,  linesep = "",
+        caption = "First-time bar passage rates for Black and White students.")
+```
+
+The overall disparity in pass rates is also reflected in yearly differences, as shown in figure \@ref(fig:RaceFigPassRates). Whites have higher pass rates most years, although there is a lot of variance in the Black pass rate by class. The variance is due to the small number of Black students - less than 20 most years - taking the bar exam in a given class.
+
+```{r RaceFigPassRates, fig.cap = "First-time bar passage rates by race and graudating class.", fig.width = 7, fig.height = 3.5}
+x_lab <- 'Graduating class'
+
+# plot of passage rates by race and grad. class for all states
+pass_all_states <- race %>%
+  # calculate pass rates by graduating class
+  calc_pass_rates(c('class', 'classification', 'result'), c("class", "classification")) %>%
+  mutate(states = 'All states')
+
+# plot of passage rates by race and grad. class for NC
+pass_nc_only <- race %>%
+  # only keep NC bar takers
+  filter(str_detect(jur, "^NC")) %>%
+  # calculate pass rates by graduating class
+  calc_pass_rates(c('class', 'classification', 'result'), c("class", "classification"))  %>%
+  mutate(states = 'NC only')
+
+pass_all_states %>%
+  bind_rows(pass_nc_only) %>%
+  filter(class != "2009") %>%
+  plot_race_diff(class, pass_rate, classification, 
+                 "Bar Pass Rate by Year and Race", x_lab, "Bar exam pass rate", TRUE) +
+  facet_wrap(~states) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+
+### Racial differences in LGPA and admissions factors
+
+Examining racial disparities in bar passage rates is complicated by disparities in predictors of bar passage. Figure \@ref(fig:RaceTabAdmissions) reveals these disparities. To ensure comparisons are possible between metrics (for example, between LGPA and LSAT), all values are standardized to have a mean of zero and standard deviation of one. As a result, zero is the average of all bar takers, one represents the top 16%, and negative one is the bottom 16%. 
+
+The admissions index in this analysis is the sum of the standardized LSAT and UGPA values, divided by 2. Additionally, the mean and standard deviation of LGPA is based on graduating class because Elon's curve did not remain constant for all years.
+
+```{r RaceTabAdmissions, fig.cap = "Differences in standardized admissions and law school metrics by race", fig.width = 7, fig.height = 5}
+# add weight column of 1, so we can use a standard function that uses weighted means
+race$weights = 1
+
+# calculate the average scaled law school GPA, LSAT, and undergrad GPA on full dataset
+metric_averages(race, c('cum_gpa_ctr', 'lsat', 'u_gpa', 'admission_idx')) %>%
+  # plot results
+  plot_race_diff(class, estimate, classification, 
+                 "Scaled LGPA and Admissions Factors of Bar Takers by Race", 
+                 x_lab, "Scaled value (0 is average)", F) +
+    facet_wrap(~metric, nrow = 2) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+    ylim(c(-2, 2)) +
+    geom_hline(yintercept = 0, alpha = .3)
+```
+
+## Modeled differences in bar passage rates between Blacks and Whites {#modelingSteps}
+
+We now proceed to modeling the relationship between bar passage rates and race, which allows us to account for LGPA, admissions factors, and other predictors of bar passage. This occurs in two steps. The first step creates a new data set by matching Black and White students with similar class ranks or admissions factor metrics, and graduating class. For continuous variables such as law school class percentile rank, students are divided into five quantiles and matched based on the quantile. 
+
+Matching occurs by taking a Black student with a given class percentile rank quantile and graduating class, matching the student with a White student exhibiting the same class rank quantile and graduating class, and adding this pair to the data set. Unmatched students are excluded from the data set. This new data set is more balanced between Black and White students regarding predictors of bar passage.^[The matching methods explained here are used throughout this report. They follow the techniques found in Imbens, G. W., & Rubin, D. B. (2018). 15. In *Causal inference for statistics, social, and biomedical sciences: An introduction.* New York: Cambridge University Press. The matching algorithm also produces propensity scores for each student. The propensity score in our context is the probability a student is of a given race, conditioned on class rank quantile and graduating class. We use the inverse of the propensity score as a weight in the regression models developed in step two. We use the same technique in subsequent electives sections where the propensity score is the probability that the student took a given elective, conditioned on the observable covariates.]
+
+Step two involves taking the matched data set and running it through Bayesian hierarchical logistic regression models. This step lets us better account for predictors of bar passage. The race term in the models provide an accurate window into differences in bar passage by race, after accounting for predictors of bar passage.^[Throughout this report, we examine regression coefficients of interest to gauge the probability that they fall either above or below zero and to evaluate magnitudes. Coefficients of interest include race in this section and whether a student took a specific bar-related course in other sections. To dampen the problem of multiple comparisons - the problem of evaluating numerous hypothesis in a single study - all coefficients of interest within models receive normally distributed priors with a mean of 0 and standard deviation of 1 on standardized data. A standard deviation of 1 regularizes the coefficients of interest. Individual-level coefficients that are not of interest, such as LGPA, are assigned weak normal priors with a standard deviation of 2.5. For the use of 1 standard deviation as a regularizing prior see McElreath, R. (2020). 7. In *Statistical rethinking: A Bayesian course with examples in R and Stan* (2nd ed.). Boca Raton: Chapman &amp; Hall/CRC.] We analyze two sets of models: one showing overall differences in bar passage by race and another highlighting yearly differences.
+
+```{r race_matched_bar_data, cache = TRUE}
+# create trimmed and matched dataset for modeling using law school gpa
+
+# clean dataset
+race_mod_base <- race  %>%
+  select(-weights) %>%
+  # MatchIt package requires numbers for categories
+  mutate(classification_cat = recode(classification, Black = 0, White = 1))
+
+# add quantiles for matching
+race_mod_base$quantile <- create_quantile(race_mod_base$cum_gpa_ctr, 5)
+race_mod_base$quant_admissions <- create_quantile(race_mod_base$admission_idx, 5)
+
+race_mod_full <- race_mod_base %>%
+  # create dataset (cannot have any NA values to due matching)
+  select(result, quantile, cum_gpa_ctr, classification, classification_cat, class, jur, state_rate_std) %>%
+  drop_na()
+
+# match dataset for full model with class rank as predictor
+race_matching <- matching_class_dataset(race_mod_full, 'Matched on law school class rank', 
+                                       'classification_cat ~ quantile + class',
+                                       'exact')
+
+# create dataset for mathcing on admissions index
+gpa_race <- race_mod_base %>%
+  select(result, classification, classification_cat, class, jur, state_rate_std, 
+         contains("u_gpa"), contains("lsat"), contains("admission")) %>%
+  drop_na()
+
+# match on admissions index
+gpa_matched <- matching_class_dataset(gpa_race, 'Matched on admissions factors', 
+                                      'classification_cat ~ quant_admissions + class', 
+                                      'exact')
+```
+
+### Differences in bar passage rates between Blacks and Whites with matched data
+
+Going back to step one, figure \@ref(fig:RacePassRateMatch) shows the overall first-time bar passage rates for Black and White students within the data set matched on law school class percentile rank quantile and graduating class. White students have slightly higher bar passage rates, but the disparity drastically shrinks compared to the raw data. The implication is that racial differences in class rank play a large role in explaining disparities in bar passage.
+
+```{r RacePassRateMatch, fig.cap = "Average bar passage rates of Black and White students with matched data.", fig.width = 4, fig.height = 1.5}
+# save as object so we can use values later
+matched_pass_rate <- calc_bar_pass(race_matching, 'Matched on law school class rank')
+
+# calculate difference in matched bar passage rate between blacks and whites
+matched_black <- matched_pass_rate$pass_rate[matched_pass_rate$classification == 'Black']
+matched_white <- matched_pass_rate$pass_rate[matched_pass_rate$classification == 'White']
+
+single_group_point_plot(matched_pass_rate, pass_rate, classification, classification, 
+                        "Avg. Bar Passage with Matched Data", "Bar passage rate", T, .075)
+```
+
+### Log-odds ratio of bar passage by race - Overall ratio  {#regressionDefinition}
+
+Moving to the step two, figure \@ref(fig:RaceRegCoefMain) shows the regression coefficient values for the race variable in each model. The blue dot indicates the most likely value, the thick blue line is the 50% credible interval, and the thin blue line highlights the 95% credible interval. Credible intervals are bounds that we can be 50% or 95% sure the true value falls within.^[All credible intervals in this report are Bayesian highest posterior density intervals (HPDI). HPDIs are the narrowest interval containing the specified probability mass. For regression coefficients, for example, the 50% HPDI is the narrowest range of possible coefficient values which contains 50% of the probability distribution of possible coefficient values.] 
+
+The regression coefficients represent the logarithm of the odds ratio (log-odds ratio) of bar passage between Black and White students. The odds ratio is the odds of bar passage for White students divided by the odds of bar passage for Black students. A log-odds ratio of zero means that Black and White students are equally likely to pass the bar. Positive log-odds ratios mean White students are more likely to pass, accounting for LGPA or admissions factors, graduating class, and bar jurisdiction.
+
+```{r}
+# create models for all states and only NC ---------------------
+
+# matching formulas
+race_matching <- c('classification_cat ~ quantile + class', 
+                   'classification_cat ~ quantile + class', 
+                   'classification_cat ~ quant_admissions + class', 
+                   'classification_cat ~ class + jur')
+
+# modeling formulas
+race_forms <- c('result ~ classification + cum_gpa_ctr + state_rate_std + (1 | class) + (1 | jur)',
+                'result ~ classification + cum_gpa_ctr + classification*year_two + state_rate_std + (1 | jur)',
+                'result ~ classification + lsat + u_gpa + state_rate_std + (1 | class) + (1 | jur)',
+                'result ~ classification + state_rate_std + (1 | class) + (1 | jur)')
+
+# combine graduating classes into groups of three years, for year model
+
+# recode classes in two year intervals
+year_two <- c(`2010` = "2010-2011",
+              `2011` = "2010-2011",
+              `2012` = "2012-2013",
+              `2013` = "2012-2013",
+              `2014` = "2014-2015",
+              `2015` = "2014-2015",
+              `2016` = "2016-2017",
+              `2017` = "2016-2017",
+              # place underscore before most current year so it is the excluded year
+              `2017-D` = "_2017D-2019",
+              `2018` = "_2017D-2019",
+              `2019` = "_2017D-2019")
+
+race_mod_full$year_two <- recode(race_mod_full$class, !!!year_two)
+
+mod_descriptions <- c("Law GPA", "Class Year", "Admissions factors", "No controls")
+```
+
+```{r raceMainMods, cache = TRUE}
+
+race_priors <- list(normal(location = c(0, 1, .2), scale = c(1, 2.5, 2.5)), 
+  normal(location = c(0, 1, rep(0,8), .2), scale = c(1, rep(2.5, 5), rep(1, 4), 2.5)),
+  normal(location = c(0, .2, .2, .2), scale = c(1, 2.5, 2.5, 2.5)),
+  normal(location = c(0, .2), scale = c(1, 2.5))
+)
+
+race_params <- list(df = list(race_mod_full, race_mod_full, gpa_race, race_mod_full),
+                    class = mod_descriptions,
+                    match_formula = race_matching,
+                    model_formula = race_forms,
+                    coef_prior = race_priors)
+
+# run all the models
+race_mod <- pmap(race_params, matching_class_model, match_method = 'exact')
+```
+
+```{r race_bar_mods, cache = TRUE}
+# find most likely value of race coefficient in first model
+race_coeff <- round(race_mod[[1]]$coefficients[['classificationWhite']], 2)
+race_admis_coef <- round(race_mod[[3]]$coefficients[['classificationWhite']], 2)
+
+# find HDI of admissions model
+race_admis_ci <- hdi(race_mod[[3]], ci = .95, parameters = "classification.*")
+
+matched_diff <- round((matched_white - matched_black)*100, 0)
+
+# create posterior of race coefficient for all models
+race_post <- map2(race_mod, mod_descriptions, function(x, y) {
+    create_class_draws(mod = x, class_col = 'classificationWhite') %>%
+      mutate(class_name = !!y)      
+})
+```
+
+Figure \@ref(fig:RaceRegCoefMain) shows three models. The 'No controls' model does not account for any academic predictors of bar passage. It only accounts for graduating class and jurisdiction. This model lets us see how disparities shrink when we do account for academic predictors. The 'Admissions factors' model accounts for LSAT, UGPA, graduating class, and bar jurisdiction. Finally, the 'Law GPA' model accounts for LGPA instead of admissions factors, along with graduating class and jurisdiction.^[All models have the same response variable (bar passage) and group-level predictors (bar jurisdiction and graduating class). They differ only in their individual-level predictors. *No Controls* has race as the sole individual-level predictor. *Admissions factors* uses race, standardized LSAT, and standardized UGPA as the individual-level predictors. Finally, *Law GPA* incorporates race and LGPA standardized by graduating class.]
+
+```{r RaceRegCoefMain, fig.cap = "Log-odds ratios of bar passage between Black and White students from three models: (1) no controls, (2) control for LSAT and UGPA, and (3) control for LGPA. Positive values signify White students have higher odds of bar passage than Black students.", fig.width = 5, fig.height = 1.75}
+# plot coefficient from overall model
+
+# full model list numbers
+full_mods <- c(1, 3, 4)
+
+# x axis label for all plots
+coef_plot_x_axis <- "Log-odds ratio of bar passage /\nLogistic regression coefficients"
+
+# x limit for all plots
+plot_x_lim <-  c(-3, 3.5)
+
+# plot draws, we'll only use first two models
+race_post[full_mods] %>%
+  bind_rows() %>%
+  # filter posterior for first two models
+  class_coeff_plot("Race and Bar Passage", 
+                 x_label = coef_plot_x_axis,
+                 y_label = "Model",
+                 axis_order = mod_descriptions,
+                 x_limit = plot_x_lim)
+```
+
+The log-odds ratios for each model reveal that accounting for admissions factors shrinks racial disparities somewhat and accounting for LGPA shrinks them even more. Looking at the admissions factor model, we see that the entire 95% credible interval lies above zero, giving us confidence that there are racial disparities in bar passage when accounting for admissions factors. Specifically, the most likely value of the disparity is the dot at `r round(race_admis_coef, 1)`. Converting this log-odds value to an odds ratio tells us that White students are around `r round(exp(race_admis_coef), 1)` times more likely to pass the bar exam than Black students with similar LSAT and UGPAs, with 95% credible intervals between `r round(exp(race_admis_ci[[3]][1]), 1)` and `r round(exp(race_admis_ci[[4]][1]), 1)` times more likely.^[We convert log-odds ratios to odds ratios through exponentiation of the log-odds ratio.]
+
+The 95% credible interval for Law GPA, however, does cross zero. As a result, we cannot say with confidence that Whites have higher bar passage rates than Blacks when accounting for class percentile rank.
+
+Table \@ref(tab:RaceTabCoefZero) highlights the probability that each log-odds ratio is above zero.^[The probabilities in the table reflect the probability of a hypothesis - in this case, that the regression coefficient is above zero - given the data. Bayesian models allow us to extract such probabilities. These probabilities contrast with frequentist probabilities called p-values which represent the probability of the data given the null hypotheses. We use the former type of probabilities in this report instead of traditional p-values.] To restate, zero means there is no difference in the odds of bar passage between Blacks and Whites, and values over zero imply that Whites have higher odds of bar passage. The probabilities reaffirm figure \@ref(fig:RaceRegCoefMain). There is strong evidence that Whites have higher odds of bar passage when accounting for admissions factors and there is only mild evidence that Whites perform better on the bar exam after accounting for class percentile rank.
+
+```{r RaceTabCoefZero}
+# create column names for all tables
+table_col_names <- c('Model', 'Prob. Above 0')
+
+# calculate probability that all states model's minority coefficient is less than 1
+race_post[full_mods] %>%
+  bind_rows() %>%
+  post_point_prob(class_name, expr(estimate > 0), T) %>%
+  arrange(class_name) %>%
+  kable(col.names = table_col_names, longtable = T, booktabs = T,  linesep = "",
+        caption = "Probability that White students have a higher odds of bar passage than Black students, accounting for bar passage predictors.")
+```
+
+### Log-odds ratio of bar passage by race - Yearly trends
+
+We now turn from overall to yearly differences. Years are grouped into two or three year time periods to add additional data to each interval. All students from the 2.5 year program are combined into the most recent interval. In looking at racial differences by year, the model accounts for LGPA, graduating class, and bar jurisdiction.^[Bar passage is the model's response variable. Individual-level predictors include race, standardized LGPA (standardized by graduating class), time interval, and an interaction term between race and time interval. Bar jurisdiction is a group-level predictor.]
+
+Figure \@ref(fig:RaceRegCoefYear) displays the log-odds ratio of bar passage between Black and White students for each time interval. No interval has a ratio with its 95% credible interval fully above or below 0. Further, there is no obvious pattern in the years. For example, the most likely values do not clearly increase or decrease as time progresses. Therefore, we cannot say that there are yearly trends in racial disparities.
+
+```{r RaceRegCoefYear, fig.cap = "Log-odds ratios between Black and Whites students and bar passage, by year. Positive values signify White students have higher odds of bar passage than Black students.", fig.width = 5, fig.height = 2.25}
+
+# calculate posterior for yearly trend
+# posterior is difference between minority and White
+
+race_mod_num_years <- 2
+
+year_minority_int <- create_interaction_posterior(race_mod[[race_mod_num_years]])
+
+# plot each year / minority status term's value
+
+year_values <- unique(year_minority_int$class_name)
+
+# need to reorder
+label_values <- c(year_values[-1], year_values[1])
+
+year_minority_int %>%
+  class_coeff_plot("Race and Bar Passage by Year", 
+                   x_label =  coef_plot_x_axis,
+                   y_label = "Graduating class year",
+                   axis_order = label_values,
+                   x_limit = plot_x_lim)
+```
+
+## Relationship between LGPA and race
+
+Up to this point, we cannot confidently say that there are racial disparities in bar passage, once we account for LGPA. We can only confidently say that disparities exist when accounting for LSAT and UGPA. But, a blind-spot in the analysis lies in the multiple avenues that unexplained disparities can emerge in the data. Specifically, we have only looked at race's direct effect on bar passage while accounting for LGPA. However, race might affect bar passage indirectly by impacting LGPA, which then affects bar passage.
+
+For this reason, an examination of the relationship between race and LGPA is warranted. The analysis will proceed in the same manner as the bar passage analysis. First, we create a matched data set between Black and White students that matches on UGPA, LSAT score, and graduating class.^[To perform exact matching on LSAT and UGPA, these metrics are transformed into five quantiles.] Then, the relationship is modeled using the matched data with three different models. 
+
+All three models have the same predictors: race, UGPA, and LSAT score as individual predictors and graduating class as a group-level predictor. The models only differ in their response variables, with LGPA, 1L GPA, and first semester GPA as the response variables for the three models.^[LGPA, 1L GPA, first semester GPA, LSAT, and UGPA are standardized to have a mean of zero and standard deviation of one. For variables that represent GPAs in law school, the values are standardized based on graduating class.] Examining the relationship between race and grades at three time periods allows us to see if changes in the relationship occur as students move through law school.
+
+```{r}
+# GPA and race models ----------------------------
+
+# create dataset for gpa and race models
+gpa_race_primary <- race_mod_base %>%
+  mutate(year_two = recode(class, !!!year_two)) %>%
+  select(result, jur, quant_admissions, contains("cum_gpa"), contains("onel_gpa"), contains("first_sem_gpa"), state_rate_std,
+         class, year_two, lsat, u_gpa, classification, classification_cat) 
+
+gpa_race_base <- gpa_race_primary %>%
+  select(-result, -jur) %>%
+  drop_na()
+
+gpa_match_formula <- 'classification_cat ~ quant_admissions + class'
+
+# create matched dataset for all models that are not highest education
+gpa_matched <- matching_class_dataset(gpa_race_base, 'GPA', gpa_match_formula, 'exact')
+
+# run models
+
+# model formulas
+gpa_mod_forms <- c(
+  'cum_gpa_ctr ~ classification + lsat + u_gpa + (1| class)',
+  'onel_gpa_ctr ~ classification + lsat + u_gpa + (1| class)',
+  'first_sem_gpa_ctr ~ classification + lsat + u_gpa + (1| class)'
+)
+```
+
+```{r race_gpa_models, cache = TRUE}
+
+# prior for first three models
+gpa_models <- map(gpa_mod_forms, function(x) {
+  stan_lmer(formula(x),
+               data = gpa_matched, 
+               adapt_delta = .995,
+               prior = normal(location = c(0, .2, .2), scale = c(1, 2.5, 2.5)),
+               weights = weights,
+               iter = 4000,
+               seed = 12345)
+})
+```
+
+```{r}
+
+# pull most likely coefficient values from cum. gpa model
+# and convert the values to the percentage point difference b/t Black and White for 
+# Blacks at the 50th percentile of cum. GPA
+race_gpa_coeff <- gpa_models[[1]]$coefficients[['classificationWhite']]
+race_gpa_coeff <- pnorm(race_gpa_coeff, 0, 1) - .5
+
+# get posterior distribution of minority status coefficient from 
+
+gpa_classes <- c("LGPA", "1L GPA", "First Sem. GPA")
+
+# create posterior distribution of classification (minority status) coefficient
+gpa_post <- map2_df(gpa_models, gpa_classes, function(x, y) {
+    create_class_draws(mod = x, class_col = 'classificationWhite') %>%
+      mutate(class_name = !!y)     
+})
+```
+
+### Law school GPA by race at different time periods for the matched data
+
+Looking to step one, figure \@ref(fig:RaceGpaDiffMatched) reveals differences in law school GPA among Blacks and Whites in the data set matched on graduating class, undergraduate GPA, and LSAT. We find GPA disparities at all time periods and the magnitude is similar among time periods.
+
+```{r RaceGpaDiffMatched, fig.cap = "Average LGPA, 1L GPA, and first semester GPA for Black and White students with matched data.", fig.width = 3.5, fig.height = 3.5}
+# calculate avg. gpa each race with all years combined, 
+# based on trimmed, matched, and weighted dataset
+
+recode_grade_times <- c(avg_gpa = 'LGPA',
+                        avg_onel = '1L GPA',
+                        avg_semester = 'First Semester GPA')
+
+weighted_gpa <- gpa_matched %>%
+  group_by(classification) %>%
+  summarize(avg_gpa = weighted.mean(cum_gpa, weights),
+            avg_onel = weighted.mean(onel_gpa, weights),
+            avg_semester = weighted.mean(first_sem_gpa, weights)) %>%
+  mutate_at(vars(avg_gpa, avg_onel, avg_semester), ~round(., 2)) %>%
+  pivot_longer(cols = contains("avg"), names_to = 'grade_time', values_to = 'gpa') %>%
+  mutate(grade_time = recode(grade_time, !!!recode_grade_times),
+         # reorder so items plot in the right order
+         grade_time = factor(grade_time, levels = recode_grade_times))
+
+# create plot of pass rates
+single_group_point_plot(weighted_gpa, gpa, classification, classification, 
+                        "Average GPA with Matched Data", "Average GPA", F, x_offset = .3) +
+  xlim(c(0,4)) +
+  facet_wrap(~grade_time, ncol = 1)
+```
+
+### Modeled association between race and law school GPA at different time periods
+
+The disparities in GPA from the matched data set provide evidence that Black students, on average, have lower GPAs than White students, even when accounting for undergraduate admissions factors and graduating class. We can account for these factors more thoroughly, however, by modeling racial disparities with the matched data set. This is step two of the analysis.
+
+The results for the three models are in figure \@ref(fig:raceGpaRegPredictions). They show the average percentage point difference in class percentile rank by race when Black students have ranks at the 50th percentile; accounting for UGPA, LSAT, and graduating class. For example, a value of 10 means that for Black students at the 50th percentile with a given UGPA, LSAT score, and graduating class, White students will, on average, have class percentile ranks 10 percentage points higher.
+
+Figure \@ref(fig:raceGpaRegPredictions) shows that White students have substantially higher class percentile ranks than Black students. The 95% credible intervals for all grade periods fall entirely above zero, so we can be confident that their values are positive. Additionally, the magnitude of the difference in class percentile ranks is similar for all three grading periods.
+
+```{r raceGpaRegPredictions, fig.cap="Average percentage point difference in class percentile rank between Black and White students for Black students at the 50th percentile of class rank.", fig.height = 1.75, fig.width = 5}
+
+# x axis label for all plots
+coef_plot_x_axis <- str_c("Avg. perc. point difference in class percentile rank")
+
+gpa_xlim <- NULL
+
+a <- gpa_post %>%
+  mutate(estimate1 = (pnorm(estimate, 0, 1)))
+
+# plot draws
+gpa_post %>%
+  # convert regression coefficients to the percentage point difference in class rank for
+  # students with a GPA at the 50th percentile
+  mutate(estimate = (pnorm(estimate, 0, 1) - .5) * 100) %>%
+  class_coeff_plot("Race and Law School Grades", 
+                 x_label = coef_plot_x_axis,
+                 y_label = "Model",
+                 axis_order = rev(gpa_classes),
+                 x_limit = gpa_xlim,
+                 horz_line = 0)
+
+
+```
+
+## Class rank as a mediator between race and bar passage
+
+Race's effect on LGPA raises the possibility that race might impact bar passage through the mediator of LGPA. In this situation, race impacts LGPA and LGPA affects bar passage. A mediation analysis isolates the indirect effect of race on bar passage, through LGPA. This analysis occurs in three steps:^[The mediation method outlined here is based on Imai, K., Keele, L., Tingley, D., & Yamamoto, T. (2011). Unpacking the black box of causality: Learning about causal mechanisms from experimental and observational studies. *American Political Science Review*, 765-789.]
+
+1. Identify race's effect on LGPA by calculating the average difference in LGPA between Black and White students, while accounting for LSAT, UGPA, and graduating class. This is accomplished through a linear regression model with LGPA as the response variable and race, LSAT, UGPA, and graduating class as the predictors.
+
+2. Create different predictions for the probability of bar passage based on the average difference in LGPA between Black and White students from step one. This is achieved through a logistic regression model with bar passage as the response and race, LGPA, and graduating class as the predictors. This average difference in bar passage probabilities is race's *indirect effect* on bar passage: its effect on bar passage through its impact on LGPA.
+
+3. Calculate race's *direct effect* on bar passage by measuring the difference in the average probability of bar passage between White and Black students, while accounting for LGPA, LSAT, UGPA, graduating class, and bar jurisdiction. This step is accomplished through the same model created in step two.   
+
+Finally, summing the direct and indirect effects gives us the *total effect* of race on bar passage. The directed acyclic graph shown in figure \@ref(fig:RaceDAG) highlights these three types of effects and their relationship.
+
+```{r RaceDAG, fig.cap = "Diagram of race's indirect effect on bar passage through LGPA.", out.width = '40%'}
+knitr::include_graphics("analysis/race/data/bar_race_dag.png")
+```
+
+```{r race_mediation_model, cache = TRUE}
+gpa_race_med <- gpa_race_primary %>%
+  select(-contains('first_sem'), -contains('onel')) %>%
+  drop_na()
+
+gpa <- lmer(cum_gpa_ctr ~ classification + u_gpa + lsat +(1 | class), 
+            data = gpa_race_med)
+
+bar <- glmer(result ~ classification + cum_gpa_ctr + u_gpa + lsat + state_rate_std + (1 | class), 
+             data = gpa_race_med, family = binomial("probit"))
+
+set.seed(7584)
+med.out <- mediate(gpa, bar, treat = "classification", mediator = "cum_gpa_ctr", sims = 2000)
+```
+
+```{r}
+# dataframe of confidence intervals, with two columns (one for lower and upper bounds)
+# will be used for plotting effect sizes
+upper_lower_ci <- bind_rows(med.out$z.avg.ci, med.out$d.avg.ci, med.out$tau.ci)
+
+mediation_effects <- tibble(
+  effect_type = c('Direct Effect', 'Indirect Effect', 'Total Effect'),
+  effect_size = c(med.out$z.avg, med.out$d.avg, med.out$tau.coef),
+  lower_ci = upper_lower_ci[[1]],
+  upper_ci = upper_lower_ci[[2]],
+  effect_group = c(rep('sub', 2), 'total')
+) %>%
+  mutate_if(is.numeric, ~(. * 100))
+
+# pull out total effects, so we can use in document
+race_total_effect <- mediation_effects %>%
+  filter(effect_type == "Total Effect") %>%
+  mutate_if(is.numeric, ~round(., 0))
+```
+
+Race's direct, indirect, and total effect on bar passage is outlined in figure \@ref(fig:raceMediation). As noted, each effect represents the average difference in the probability of bar passage between Black and White students, accounting for the predictors in the models. Positive numbers mean that White students have higher average probabilities of bar passage. The lines are 95% confidence intervals.^[Confidence intervals are used for the mediation analysis instead of Bayesian credible intervals. This is because we use a frequentist framework in the mediation analysis.]
+
+```{r raceMediation, fig.cap = "Direct, indirect, and total effects of race on bar passage. Values are the average percentage point difference in bar passage after accounting for LGPA, graduating class, and bar jurisdiction.", fig.height = 1.75, fig.width = 5}
+ggplot(mediation_effects, aes(effect_size, fct_rev(effect_type), color = effect_group)) +
+  geom_point() +
+  geom_segment(aes(x = lower_ci, xend = upper_ci, yend = effect_type)) +
+  geom_vline(xintercept = 0, alpha = .6) +
+  xlim(-10, 30) +
+  labs(title = 'Cumulative Effects of Race on Bar Passage',
+         x = "Percentage point difference (White minus Black)\nIn avg. probability of bar passage",
+         y = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = rel(1.1)),
+        legend.position = 'none')
+```
+
+Confirming the analysis in section \@ref(regressionDefinition), the direct effect's confidence interval crosses zero. Therefore, we cannot confidently say that race directly impacts bar passage, once we account for LGPA. But, the confidence interval for race's indirect effect on bar passage lies fully above zero, giving us confidence that race impacts bar passage through LGPA. 
+
+Combining these two effects, and their uncertainty, gives us a total effect of race on bar passage between `r race_total_effect$lower_ci` and `r race_total_effect$upper_ci` percentage points, with a most likely value of `r race_total_effect$effect_size` percentage points. This means that the average probability of bar passage for Black students is between `r race_total_effect$lower_ci` and `r race_total_effect$upper_ci` percentage points lower than the probabilities for Whites students with similar LGPAs. Given these values, the mediation analysis does reveal stark racial disparities in bar passage.
+
+## Conclusion
+
+Race's effect on bar passage is nuanced. There is not clear evidence that direct racial disparities exist in bar passage rates between Blacks and Whites when we account for LGPA. But, racial disparities do occur in LGPA, even when accounting for LSAT and UGPA. White students have higher LGPAs. This latter disparity creates downstream racial disparities in bar passage since LGPA is highly predictive of bar passage.

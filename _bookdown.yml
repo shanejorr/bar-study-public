@@ -1,0 +1,11 @@
+book_filename: "Elon-final-report"
+language:
+  ui:
+    chapter_name: "Section "
+delete_merged_file: false
+rmd_subdir: true
+rmd_files: ["index.Rmd", "analysis/race/01-race.Rmd", "analysis/doctrinal-required/02-doctrinal-required.Rmd",
+           "analysis/skills-electives/03-skills-elective.Rmd", "analysis/doctrinal-elective/04-doctrinal-elective.Rmd", 
+           "analysis/commercial-prep/05-commercial-prep.Rmd", "06-appendix.Rmd"]
+
+after_chapter_script: "after_chapter_scripts.R"

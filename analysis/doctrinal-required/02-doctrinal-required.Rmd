@@ -1,0 +1,287 @@
+# Required Bar-related Courses and Bar Passage
+
+```{r doc_req_setup}
+
+library(rstanarm)
+library(tidybayes)
+library(modelr)
+library(glue)
+library(knitr)
+library(corrplot)
+library(kableExtra)
+library(gridExtra)
+library(tidyverse)
+
+# use dplyr select instead of MASS select
+select <- dplyr::select
+
+options(mc.cores = parallel::detectCores())
+
+# import custom functions for file
+source('analysis/analysis_functions.R')
+source('analysis/doctrinal-required/doctrinal-required-functions.R')
+```
+
+Elon Law students take required classes in ten subject areas related to the bar exam: Civil Procedure, Torts, Contracts, Criminal Law, Property, Evidence, Business Associations, Legal Methods and Communication (LMC), and Bar Exam Foundations (BEF). All classes except LMC and BEF are doctrinal courses focusing on an area of law. LMC is a seven-credit program for first year students which teaches them legal research, writing, and oral communication. BEF, meanwhile, aims to equip students with tools to pass the bar. This section examines the relationship between grades in each subject and bar passage rates.
+
+We used grades for all bar takers in all bar jurisdictions from the class of 2010 to the class of 2019 in the analysis. Prior to Elon Law's curriculum change in 2015, many of the ten subjects spanned multiple classes. For example, students took Civil Procedure I & II in the Fall and Spring of their 1L year prior to 2015. Subsequent to the curriculum change, however, Elon Law combined many of these multi-semester classes into a single-semester class.
+
+To standardize the analysis across years, and to reduce the number of class comparisons being made, we calculated a weighted average grade for each subject and student. The weighted average grade is the student's grade point average within the given subject. In this situation, each student has one, and only one, grade for each subject.
+
+```{r doc_req_import_data}
+# import data ---------------------------------
+
+df <- read_csv("analysis/doctrinal-required/data/doctrinal-required_raw.csv") %>%
+  # convert 2016-D class to 2017 since these students entered the same year
+  mutate(class = str_replace(class, "2016-D", "2017"),
+         class = str_replace(class, "2015-D", "2016")) %>%
+  # calculate percent ranks in doctrinal classes for individual years
+  group_by(class) %>%
+  # standardized gpa
+  mutate_at(vars(contains("cum_gpa")), list(ctr = ~scale(.))) %>%
+  ungroup() %>%
+  # make Feb 19 and later NC bar takers their own jurisdiction since this is when NC transitioned to
+  # UBE and bar rates went up a lot
+  mutate(jur = ifelse((date %in% c("19F", "19J", "20F")) & (jur == "NC"), "NC_ube", jur))
+```
+
+## Correlations between required classes
+
+We first look at correlations between law school course grades in individual courses.^[All required course grades are standardized by graduating class to have a mean of zero and standard deviation of one.] The correlations tell us how closely grades in one subject track grades in a different subject. 
+
+Figure \@ref(fig:DocReqClassCorr) shows the correlations between grades in required courses. We include LGPA as well for reference. For correlations, higher numbers represent stronger associations between course grades. Most of the correlations are between .3 and .5, signifying a moderate association. Of note is that LGPA has a higher correlation, in general, with specific classes than specific class have among each other.
+
+```{r DocReqClassCorr, fig.cap = "Correlations between class percentile ranks in required bar-related classes."}
+plot_cors <- df %>%
+  select(ends_with('_ctr')) %>%
+  select(cum_gpa_ctr, everything()) %>%
+  cor(use = "complete.obs")
+
+rowcolnames <- c('LGPA', 'Bus. Assoc.', 'Civ. Pro.', 'Con. Law', 'Contracts',
+                 'Crim. Law', 'Evidence', 'Property', 'Torts',  'LMC', 'BEF')
+
+colnames(plot_cors) <- rowcolnames
+rownames(plot_cors) <- rowcolnames
+
+corrplot(plot_cors, method = "number", type = "upper", number.cex = .9)
+```
+
+Table \@ref(tab:DocReqTopCorClasses) highlights the ten highest correlations between subjects. The column order of the classes in the table - whether the class is in the column 'Class 1' or 'Class 2' - is irrelevant.
+
+```{r DocReqTopCorClasses}
+plot_cors <- plot_cors %>%
+  as.data.frame() %>%
+  select(-LGPA) %>%
+  rownames_to_column() %>%
+  pivot_longer(cols = -rowname) %>%
+  filter(rowname != "LGPA",
+         value != 1) %>%
+  arrange(desc(value))
+
+# each class combination will be in dataset twice, 
+plot_cors <- plot_cors[!duplicated(plot_cors$value),]
+
+plot_cors <- plot_cors %>%
+  mutate(rank = seq(1, nrow(.)),
+         value = round(value, 2)) %>%
+  select(rank, everything())
+
+kable(plot_cors[c(1:10),],
+      col.names = c("Rank", "Class 1", "Class 2", "Correlation"), 
+      longtable = T, booktabs = T, linesep = "",
+      caption = "Ten highest GPA correlations among required courses.")
+```
+
+To better look at how required courses compare overall, table \@ref(tab:DocReqAvgCorr) lists each course's average correlation with all other courses. For example, Torts' correlation is the average of Torts' grade correlations with all other subjects' correlations. Con Law has the highest average correlation with other courses and BEF has the lowest. BEF's low correlation is not surprising since it's one of two bar-related required courses that does not center on a specific area of law. Additionally, the difference between the largest and smallest correlations is 0.08, which is relatively small. Therefore, classes correlate with each other very similarly. 
+
+```{r DocReqAvgCorr}
+# unite the two class column into one column, which makes filtering for a class easier
+united_cors <- plot_cors %>%
+  unite("united_class", rowname, name)
+
+# calculte average correaltions for each class using custom function, placing them into table
+map_df(rowcolnames[c(2:length(rowcolnames))], class_corr,
+       df = united_cors, class_col = united_class, cor_col = value) %>%
+  arrange(desc(corr)) %>%
+  kable(col.names = c('Subject', 'Avg. Correlation'), longtable = T, booktabs = T, linesep = "",
+        caption = "Each doctrinal required course's average course GPA correlation with all other courses.")
+```
+
+## Modeled relationship between bar passage and bar-related required course grades
+
+Moving to the core of this section, we next explore the relationship between required course grades and bar passage rates through two types of Bayesian hierarchical logistic regression models. The first type measures the relationship between required course grades and bar passage, without controlling for grades in any other classes. It includes course grade as an individual predictor, and law school graduating class and bar jurisdiction as group-level predictors.^[Course grades are standardized by graduating class in all models.] Ten different models were created; one for each required course.
+
+The second type of model accounts for grades in all other required courses when measuring the association between a single required course grade and bar passage. This model allows us to gauge the association between bar passage and required course grades, accounting for the grades a student received in all required courses except the one under examination. For example, Con Law's value is Con Law's association with bar passage, after accounting for grades in all required courses except Con Law. The parallel value for 'GPA in Required Courses' is the association between bar passage and cumulative GPA in all required courses except Con Law, after accounting for Con Law grades.
+
+```{r doc_req_models}
+df <- df %>%
+  # remove all rows with a missing value in any column of a class that has been required since the first Elon class
+  drop_na(cum_gpa_bus_assoc:cum_gpa_torts) %>%
+  # add a small amount of noise to each class grade (mean = 0, std. dev. = .005)
+  # so that class percentile ranks do not clump together representing the same number
+  # helps algorithms run faster and has almost no impact on results
+  mutate_at(vars(contains('_ctr')), ~(. + rnorm(length(.), 0, .005)))
+
+req_class_col <- str_extract(colnames(df), ".*_ctr")
+req_class_col <- req_class_col[!is.na(req_class_col)]
+# remove percent rank
+req_class_col <- str_remove(req_class_col, "cum_gpa_ctr")
+req_class_col <- req_class_col[req_class_col != ""]
+```
+
+```{r doc_req_run_models, cache = T}
+# create models for association between doctrinal class GPA and bar passage.
+
+# without cumulative GPA as predictor
+
+# formulas for models without cumulative gpa
+without_class_form <- glue("result ~ {req_class_col}  + state_rate_std + (1 | class) + (1 | jur)")
+
+# prior probabilities for the regression coefficients in models with without cumulative gpa
+coef_prior_without <- normal(location = c(0, .3),
+                             scale = c(1, 2.5))
+
+# create all models (one for each class) for classes without cumulative gpa as predictor
+mods_without <- map(without_class_form, single_class_model, 
+                    df = df, coef_prior = coef_prior_without, weight = F)
+
+# with cumulative GPA as predictor
+
+# list of classes, with class name only, not columns
+# function that calculates GPA in all doctrinal required courses except one in question requires only class names
+req_class_names <- req_class_col %>%
+  str_remove("cum_gpa_") %>%
+  str_remove("_ctr")
+
+# create all models (one for each class) for classes with cumulative gpa as predictor
+mods <- map(req_class_names, mod_with_total_grade, df = df)
+```
+
+Figure \@ref(fig:DocReqRegCoef) visualizes the results from each model type. The top graph, representing the first type, shows the association between required course grades and bar passage after accounting for graduating class and bar jurisdiction. All courses have positive associations with bar passage. Con Law has the largest association all other courses share similar associations.
+
+The bottom graph of figure \@ref(fig:DocReqRegCoef) shows results from the second model type. All courses have their entire 95% credible intervals falling above zero. Therefore, we can be confident that grades in required courses have positive associations with bar passage, even when accounting for required course GPA. Con Law, Business Associations, Evidence, and BEF are clustered together as having the highest associations.
+
+An additional take-away from the second model type is that no single course has a stronger association with bar passage than an aggregate of all courses. This is shown in plot 2 where for all courses, the association between bar passage and required course GPA is stronger than the association between bar passage and a single course. Stated more succinctly, the red points are to the right of the blue points. If the aim is to identify students at risk of failing the bar, Elon is better served going with an aggregate of all required courses opposed to looking at a single course.
+
+```{r DocReqRegCoef, fig.cap = "Relationship between required bar-related course grades and bar passage. Top graph is raw relationship, bottom graph accounts for cumulative GPA in all other bar-related required courses. Positive values signify a positive association.", fig.height = 7, fig.width = 5.2}
+
+# create point plot of individual model coefficients ------------------------------------
+
+# extract highest density interval of each model for both class and percent rank
+
+map_names_rank <- c(`cum_gpa_con_law_ctr` = "Con Law",   
+               `cum_gpa_bus_assoc_ctr` = "Bus. Assoc.",
+               `cum_gpa_property_ctr` = "Property",
+               `cum_gpa_torts_ctr` = "Torts",
+               `cum_gpa_crim_law_ctr` = "Crim. Law",
+               `cum_gpa_contracts_ctr` = "Contracts",
+               `cum_gpa_lmc_ctr` = "LMC",
+               `cum_gpa_evidence_ctr` = "Evidence",
+               `cum_gpa_civ_pro_ctr` = "Civ. Pro.",
+               `cum_gpa_bef_ctr` = "BEF")
+
+# create coefficient plot of models without class rank as a predictor
+
+# extract posterior of doctrinal class coefficients
+class_draws_without_rank <- map2_df(mods_without, req_class_col, create_class_draws) %>%
+    mutate(class_name = recode(class_name, !!!map_names_rank))
+
+x_limits <- c(-0.5,2.5)
+
+y_axis_order <- create_axis_orders(class_draws_without_rank)
+
+# create plot of doctrinal class coefficients wihout class rank
+plot_without_rank <- class_coeff_plot(class_draws_without_rank, 
+                 "Relationship Between Class Grades and Bar Passage", 
+                 x_label = NULL,
+                 y_label = "Required course",
+                 axis_order = y_axis_order, x_limit = x_limits,
+                 sub_label = "1. Without accounting for required course GPA") +
+  theme(axis.text.x=element_blank())
+
+# create coefficient plot of models with cum. gpa as a predictor
+
+# extract posterior draws of doctrinal gpa and cum. gpa
+class_draws_with_rank <- map2_df(mods, req_class_col, create_cum_gpa_draws) %>%
+  mutate(class_name = recode(class_name, !!!map_names_rank)) 
+
+# create ranks of HDI for doctrinal classes, to be used in creating y axis for plot
+without_axis_order <- create_axis_orders(class_draws_with_rank)
+
+# custom color scale so that colors match plot with only doctrinal classes
+cols <- c('Course GPA' = "#2960AC", 'Req. Course GPA' = "#c93838")
+
+plot_with_rank <- class_draws_with_rank %>%
+  pivot_longer(cols = c('cum_gpa_doc', 'estimate'), 
+               names_to = 'class_type', values_to = 'estimate') %>%
+  mutate(class_type = recode(class_type, cum_gpa_doc = 'Req. Course GPA',
+                                         estimate = 'Course GPA')) %>%
+  group_by(class_name, class_type) %>%
+  ggplot(aes(y = factor(class_name, levels = y_axis_order), 
+             x = estimate, 
+             color = factor(class_type, levels = rev(unique(class_type))))) +
+    stat_pointinterval() +
+    scale_colour_manual(values = cols) +
+    geom_vline(xintercept = 0, alpha = .6) +
+    xlim(x_limits) +
+    labs(title = NULL,
+         subtitle = "2. With accounting for required course GPA",
+         x = "Association between class grades and bar passage /\nLogistic regression coefficients",
+         y = "Required course",
+         color = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = rel(1.1)),
+          legend.position = 'bottom')
+
+grid.arrange(plot_without_rank, plot_with_rank, nrow = 2)
+```
+
+### Predicted bar passage probability given required course class rank
+
+Another way to evaluate the association between bar passage and required course grades is to examine average bar passage probabilities given required course class percentile ranks. This is displayed in figure \@ref(fig:DocReqPredPass) using associations extracted from the second model type. There are two lines, one for students at the bottom 33% of rank in required courses - minus the specific course listed in the plot - and one for students at the top 33%. The probabilities assume the student is from the graduating class of 2019 and taking the February 2020, North Carolina bar exam. 
+
+Since the associations come from the second model type, the results align with those in the second model in figure \@ref(fig:DocReqRegCoef). Con law has the steepest slope and all other classes have positive slopes. In terms of magnitude, however, there is little practical difference in the slopes for each class.
+
+```{r DocReqPredPass, fig.cap = "Average probability of bar passage given class percentile rank in bar-related required courses, for students at the bottom and top 33% of required course class percentile rank.", fig.height = 8, fig.width = 9}
+# predictions with most recent bar year in NC -------------------------------------
+
+# iterate through each model, add fitted draws to separate list
+single_class_draws <- map2_df(req_class_col, mods, make_fitted_draws, df = df)
+
+# calculate posterior predictions for each class
+coef_posterior <- single_class_draws %>%
+  # convert standardized GPA to class rank, for interpretability
+  mutate(class_perc_rank = round(pnorm(class_grade, 0, 1), 3)) %>%
+  group_by(class_name, cum_gpa_doc, class_perc_rank) %>%
+  median_hdi(.width = .9)
+
+coef_posterior %>%
+  ungroup() %>%
+  mutate(class_name = recode(class_name, !!!map_names_rank),
+         class_name = factor(class_name, levels = y_axis_order)) %>%
+  ggplot(aes(x = class_perc_rank, y = .value, color = cum_gpa_doc, fill = cum_gpa_doc)) +
+    geom_line(alpha = .8, size = .8) +
+    geom_ribbon(aes(ymin = .value.lower, ymax = .value.upper), 
+                alpha = .25, linetype = 0, size = 0, show.legend = FALSE) +
+    facet_wrap(~factor(class_name, levels = rev(y_axis_order)), ncol = 4) +
+    scale_color_brewer(palette = "Set2") +
+    scale_fill_brewer(palette = "Set2") +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .20), labels = scales::percent) +
+    scale_x_continuous(limits = c(.2, .8), breaks = seq(.2, .8, .2), 
+                       labels = scales::percent_format(accuracy = 1)) +
+    labs(title = "Probability of Bar Passage on NC Bar Exam Given Grade in Required Class",
+         subtitle = "Bands are 90% credible intervals",
+         x = "Class rank in required course",
+         y = "Bar passage probability",
+         color = "Required Courses Class Rank") +
+    theme_minimal() +
+    theme(legend.position="bottom")
+```
+
+## Conclusion
+
+All required courses have positive associations with bar passage, even when accounting for cumulative grades in all required courses. Con Law has the strongest association, but differences in magnitude between Con Law and most other courses is minimal. Additionally, the association between grades in all required courses and bar passage is much stronger than the association between grades in any single class and bar passage. Therefore, aggregating grades provides a much better predictor of bar passage than grades in a single course.
+
+Finally, caution should be exercised in interpreting these results. Since these courses are required, we are unable to compare bar passage rates between students who did and did not take a specific required course. Therefore, it is difficult to drill down at the causal mechanism of why students who perform well in a required class also see their probability of bar passage improve. We do not know whether the association is because doing well in the course signifies that a student knows the material and knowing the material increases the probability of bar passage, or whether there are other unknown factors that correlate with bar passage and a student's grade in a specific course.
+
+The probability we want to know is how much a student's probability of bar passage changes if she did not take the required course. This gets us closer to knowing the causal impact of the course on bar passage. Unfortunately, such a probability is unknowable for required courses. We will, however, conduct such a comparison in subsequent sections focusing on electives.

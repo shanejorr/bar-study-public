@@ -1,0 +1,35 @@
+---
+title: "Evaluation of Elon Law Bar Prep Programs and Classes"
+date: "October 2020"
+author: ""
+output:
+  bookdown::pdf_book:
+    includes:
+      in_header: preamble.tex
+site: bookdown::bookdown_site
+documentclass: book
+github-repo: shanejorr/bar-study
+description: "This report is an evaluation of Elon Law's bar preparation programs and courses. It evaluates required courses, skills electives, doctrinal electives, and bar preparation courses. The AccessLex Institute supported this evaluation through a grant to Elon Law."
+geometry: "left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm"
+lof: True
+lot: True
+fontsize: 12pt
+---
+
+# Executive Summary {-#execSum}
+
+Elon Law, with funding from the AccessLex Institute, conducted an evaluation of the impact of various courses on bar passage. The courses include skills-related classes such as Multistate Bar Exam, doctrinal courses such as Con Law, and commercial prep courses. The evaluation had five aims:
+
+1.  Quantify any racial disparities in bar passage, if they exist.
+2.  Quantify the relationship, if any, between grades in bar-related required courses and bar passage.
+3.  Identify which, if any, bar exam skills-related electives and bar-support optional programming leads to an increased likelihood of bar passage when students take the elective or participate in the program.
+4.  Identify which, if any, bar exam-tested doctrinal electives lead to an increased likelihood of bar passage when students take the elective.
+5.  Identify which, if any, commercial bar preparation courses lead to an increased likelihood of bar passage.
+
+The evaluation found the following:
+
+1.  Racial disparities in bar passage do exist. When accounting for LSAT and undergraduate GPA (UGPA), Black students have lower bar passage rates than White students. Disparities are eliminated, however, when we account for cumulative law school GPA (LGPA). But, we also find racial disparities in LGPA even when accounting for LSAT and UGPA. Since LGPA is strongly associated with bar passage, racial these disparities drive racial disparities in bar passage.
+2.  All required bar-related courses have a positive association with bar passage. This holds even when accounting for cumulative grades in all bar-related required courses. Con Law, Business Associations, Evidence, and Bar Exam Foundations have the largest associations. But, the association between cumulative bar-related GPA is stronger than the association between any specific course and bar passage. Therefore, if Elon Law seeks to identify students at risk of failing the bar they are best served by using students' cumulative bar-related GPA in all required courses.
+3.  There is insufficient evidence to claim that students who take skills-related electives perform better on the bar exam than those not taking such courses. This holds for all skills-related courses examined.
+4.  Moving to doctrinal-electives, students taking Wills and Trust, Sales, or Family Law performed better on the bar exam than those not taking each given course, even after accounting for predictors of bar passage. This means that three of the six doctrinal-electives examined have a positive impact on bar passage.
+5.  Students taking Kaplan as a commercial prep course perform worse on the bar exam than those taking either Themis or BarBri. Themis and BarBri students perform almost identically. These finding hold even after accounting for predictors of bar passage.

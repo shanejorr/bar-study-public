@@ -1,0 +1,340 @@
+# Commercial Prep Courses and Bar Passage
+
+```{r com_prep_setup}
+
+library(rstanarm)
+library(tidybayes)
+library(modelr)
+library(glue)
+library(knitr)
+library(twang)
+library(tidyverse)
+
+# use dplyr select instead of MASS select
+select <- dplyr::select
+
+options(mc.cores = parallel::detectCores())
+
+# import custom functions for file
+source('analysis/analysis_functions.R')
+```
+
+```{r custom_func}
+# bar plot of bar passage rates
+# used to calcualte overall rates and matched dataset rates
+prep_co_pass <- function(df, plot_title, plot_subtitle) {
+  
+  df %>%
+    ggplot(aes(x = jur, y = pass_rate, group = prep_co)) +
+    geom_col(aes(fill = prep_co), position = position_dodge(preserve = "single")) +
+    scale_color_brewer(type = "Qual", palette = "Set2") +
+    scale_fill_brewer(type = "Qual", palette = "Set2") +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .20), labels = scales::percent) +
+    geom_text(aes(label = glue("{round(pass_rate, 2) * 100}%"), y = pass_rate + 0.05), 
+              position = position_dodge(.9), color = "#4d4d4d") +
+    labs(title = plot_title,
+         subtitle = plot_subtitle,
+         x = "Bar Exam Jurisdiction",
+         y = "Bar Passage Rate",
+         fill = NULL,
+         color = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = rel(1.1)),
+          legend.position="bottom")
+}
+# function to create propensity score weights for all states dataset and NC only
+com_prep_propensity <- function(df, formula) {
+  
+  prop_score <- mnps(as.formula(formula),
+   data = df,
+   estimand = "ATE",
+   verbose = FALSE,
+   stop.method = c("es.mean", "ks.mean"),
+   n.trees = 3000)
+  
+  return(get.weights(prop_score, stop.method = "es.mean"))
+  
+}
+```
+
+```{r import_data}
+df <- read_csv("analysis/commercial-prep/data/comm-prep_raw.csv") %>%
+  # make missing state rate value (there is only one) 0, which is average
+  replace_na(list(state_rate = 0)) %>%
+  # convert 2016-D class to 2016 since these students entered the same year
+  mutate(class = str_replace(class, "2016-D", "2016")) %>%
+  # make Feb 19 NC bar takers and later their own jurisdiction since this is when NC transitioned to
+  # UBE and bar rates went up a lot
+  mutate(jur = ifelse((date %in% c("19F", "19J", "20F")) & (jur == "NC"), "NC_ube", jur)) %>%
+  mutate(prep_co = str_trim(str_to_title(prep_co))) %>%
+  # standardize cumulative GPA
+  group_by(class) %>%
+  mutate(cum_gpa_ctr = scale(cum_gpa)) %>%
+  ungroup() %>%
+  filter(prep_co %in% c("Barbri", "Themis", "Kaplan"))
+```
+
+The majority of Elon Law students take a commercial bar preparation course two months prior to sitting for the bar exam. Kaplan, Barbri, and Themis are the three primary providers. This section analyzes the association between bar passage and these three courses. It starts by providing an overview of the raw data concerning bar passage and commercial prep courses and then models the relationship for a more fine-grained picture.
+
+## Overview of the data
+
+### Number of bar takers who took each course
+
+Data on commercial prep courses goes back to the class of 2010. But, some data in the early years is either incomplete or all students in the data set took the same commercial prep course for a given year. As figure \@ref(fig:comNumTakingPrep) shows, 2015 is the first year where there is both a large number of students in the data set and a mixture of students among different courses. For this reason, we exclude graduating classes prior to 2015 from our analysis.
+
+```{r comNumTakingPrep, fig.cap = "Number of students taking each bar prep course.", fig.width = 6, fig.height = 3}
+df %>%
+  group_by(class, prep_co) %>%
+  count() %>%
+  arrange(class, prep_co) %>%
+  ggplot(aes(x = class, y = n, color = prep_co, fill = prep_co)) +
+    geom_col(position = position_dodge(preserve = "single")) +
+    scale_color_brewer(type = "Qual", palette = "Set2") +
+    scale_fill_brewer(type = "Qual", palette = "Set2") +
+    labs(title = "Number of Students in Data Set Taking Bar Prep Courses",
+         x = "Graduating Class",
+         y = "Number of Students",
+         fill = NULL,
+         color = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = rel(1.1)),
+          legend.position="bottom")
+```
+
+### Bar passage rates by commercial prep course
+
+Comparing overall bar passage rates between the three courses, Kaplan takers have an eight percentage point lower pass rate than Barbri for the 2015 - 2019 graduating classes, and almost a fifteen percentage point lower pass rate than Themis. The difference shrinks when we center on NC bar takers, but Kaplan still has the lowest bar passage rate.
+
+```{r comPassRate, fig.cap = "First-time bar passage rates by commercial prep course.", fig.height=3.5, fig.width=4}
+# calcualte overall pass rate between courses --------------------
+
+# filter dataset to only include 2015 and later
+years_keep <- c(as.character(seq(2015, 2019, 1)), "2017-D")
+
+df_15 <- df %>%
+  filter(class %in% !!years_keep)
+
+# create function to calculate pass rate for all states and only NC
+calc_prep_pass_rate <- function(df, jurisdiction) {
+  
+  df %>%
+    group_by(prep_co) %>%
+    summarize(num = n(),
+           total_pass = sum(result),
+           pass_rate = total_pass / num) %>%
+    mutate(jur = !!jurisdiction)
+  
+}
+
+# calculate all state and NC pass rates by commercial prep
+all_state_pass <- calc_prep_pass_rate(df_15, "All States")
+nc_pass <- calc_prep_pass_rate(df_15[str_detect(df_15$jur, "NC"),], "NC")
+
+# create plot
+all_state_pass %>%
+  bind_rows(nc_pass) %>%
+  prep_co_pass("Commercial Prep Bar Passage Rates", "Graduating Classes 2015 - 2019")
+```
+
+### Average class percentile ranks for students taking each bar prep course
+
+Kaplan's lower bar passage rate could be caused, in part, by students with lower class percentile ranks choosing Kaplan over Barbri or Themis. As figure \@ref(fig:comClassRank) highlights, the average class percentile rank for students choosing Kaplan is four percentage points lower than the average class percentile rank for Barbri and nine percentage points lower than Themis.
+
+```{r comClassRank, fig.cap = "Average class percentile rank for each commercial prep course.", fig.height=3, fig.width=3.5}
+df_15 %>%
+  group_by(prep_co) %>%
+  summarize(mn_rank = mean(perc_rank)) %>%
+  ggplot(aes(x = prep_co, y = mn_rank, color = prep_co, fill = prep_co)) +
+    geom_col(position = position_dodge(preserve = "single")) +
+    scale_color_brewer(type = "Qual", palette = "Set2") +
+    scale_fill_brewer(type = "Qual", palette = "Set2") +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .20), labels = scales::percent) +
+    geom_text(aes(label = glue("{round(mn_rank, 2) * 100}%"), y = mn_rank + 0.05), 
+              position = position_dodge(.9), color = "#4d4d4d") +
+    labs(title = "Class Ranks for Comm. Prep Courses",
+         subtitle = "Graduating Classes 2015 - 2019",
+         x = NULL,
+         y = "Mean Class Percentile Rank",
+         fill = NULL,
+         color = NULL) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = rel(1.1)),
+          legend.position="none")
+```
+
+## Modeled relationship between bar passage and commercial prep courses
+
+### Modeling methodology
+
+We now model the relationship between bar passage and commercial prep courses to account for differences in LGPA, graduating class, and bar jurisdiction. Two models were created, one for all states and one with only North Carolina bar takers.
+
+The modeling process involves two steps. We first assign to each student the probability that she took the prep course she ended up taking, given her LGPA, graduating class, and bar jurisdiction. The data is then reweighted based on the inverse of this probability. Reweighting the data minimizes differences among the three prep courses in LGPA, graduating class, and bar jurisdiction.
+
+The reweighted data is then fed into a weighted Bayesian hierarchical logistic regression model. The model's predictor is Bar passage. Bar prep course and LGPA are the individual terms within the model, and graduating class and bar jurisdiction are the group-level terms.^[We standardized LGPA so that the mean LGPA for each graduating class is zero and the standard deviation is one.] Using the inverse probability weights in a regression model creates double robustness to account for differences in LGPA, graduating class, and bar jurisdiction when analyzing the relationship between bar prep courses and bar passage. This process is used for the all states and NC only models, except the NC only model does not use bar jurisdiction.
+
+### Commercial prep course bar passage rates with weighted data
+
+Bar passage rates with the inverse probability weighted data set from step one are presented in figure \@ref(fig:comPrepMatchedPassRates). They tell the same story as the raw data: Barbri and Themis have near identical pass rates and Kaplan trails both.
+
+```{r}
+
+# create bayesian hierarchical model for bar passage and commercial prep courses -----------
+
+df_mod <- df_15 %>%
+  mutate_at(vars(prep_co, class, jur), ~as.factor(.)) 
+
+df_mod_nc <- df_mod %>%
+  filter(str_detect(df_mod$jur, "NC"))
+```
+
+```{r com_prep_propensity, cache = T}
+# add weights to all states dataset and NC dataset
+df_mod$weights <- com_prep_propensity(df_mod, "prep_co ~ cum_gpa_ctr + class + jur")
+df_mod_nc$weights <- com_prep_propensity(df_mod_nc, "prep_co ~ cum_gpa_ctr + class")
+```
+
+```{r comPrepMatchedPassRates, fig.cap = "Bar passage rates by commercial prep course. Data is weighted by the inverse of the probability that the student took the prep course that she ended up taking.", fig.height=3.5, fig.width=4}
+ 
+# calculate weighted pass rate (weighted by propensity score)
+# for each commercial prep company
+matched_prep_pass <- map2_df(list(df_mod, df_mod_nc), c('All States', 'NC Only'), 
+                             function(x, y) {
+  x %>%
+    group_by(prep_co) %>%
+    summarize(pass_rate = weighted.mean(result, weights)) %>%
+    mutate(jur = !!y)
+})
+
+prep_co_pass(matched_prep_pass, "Commercial Prep Bar Pass Rates", 
+             "Graduating Classes 2015 - 2019 | Weighted Data")
+```
+
+### Log-odds ratio of bar passage between commercial prep courses
+
+```{r com_prep_models, cache = T}
+# formula for model
+mod_form <- c(
+  "result ~ prep_co + cum_gpa_ctr + (1 | class) + (1 | jur)",
+  "result ~ prep_co + cum_gpa_ctr + (1 | class)"
+  )
+
+# coefficient priors
+mod_prior <- normal(location = c(0, 0, 1), scale = c(1, 1, 2.5))
+
+# create models for all states and NC only
+mod_all <- single_class_model(df_mod, mod_form[1], mod_prior, weight = T)
+mod_nc <- single_class_model(df_mod_nc, mod_form[2], mod_prior, weight = T)
+```
+
+```{r}
+mods <- list(mod_all, mod_nc)
+
+recode_names <- c(kap_minus_barbri = 'Kaplan versus Barbri',
+                  themis_minus_barbri = 'Themis versus Barbri',
+                  kap_minus_themis = 'Kaplan versus Themis')
+
+# create posterior of difference in commercial prep coefficients for all state mod and NC on mod
+
+jurs <- c('All States', 'NC Only')
+
+# get the posterior of the difference between comparison course coefficients
+mods_coef_posterior <- map2_df(mods, jurs, function(mods, jurs) {
+  
+  mods %>%
+    spread_draws(`prep_co.*`, regex = T) %>%
+    mutate(kap_minus_themis = prep_coKaplan - prep_coThemis,
+           jur = !!jurs) %>%
+    rename(kap_minus_barbri = prep_coKaplan, themis_minus_barbri = prep_coThemis) 
+})%>%
+  pivot_longer(cols = contains("minus")) %>%
+  mutate(name = recode(name, !!!recode_names)) %>%
+  rename(class_name = name, estimate = value)
+```
+
+Moving to the second step, the output of interest for each model is the log-odds ratio of bar passage between two prep courses. Themis versus Barbri, for example, represents the odds of bar passage for students who take Themis divided by the odds for students who take Barbri. This is the odds-ratio. We then take the natural logarithm of the odds-ratio to arrive at the log-odds ratio. Positive numbers mean the odds of bar passage for the first listed class are higher, while negative numbers imply that they are lower.^[These are the regression coefficients from the model, of which Barbri is the omitted variable. As a result, Kaplan versus Barbri is the Kaplan coefficient, Themis versus Barbri is the Themis coefficient, and Kaplan versus Themis is the difference between the Kaplan and Themis coefficients.]
+
+The results, which are displayed in figure \@ref(fig:comRegCoef), show a clear distinction between Themis and Barbri on one hand, and Kaplan on the other. Looking at both the all states model and the NC only model, the values for Kaplan versus Themis and Kaplan versus Barbri are both negative. Therefore, students choosing Kaplan have lower odds of bar passage compared to Themis and Barbri. Since the entire 95% credible interval is negative for both Kaplan values, there is strong evidence for this finding. Conversely, Themis versus Barbri sits near zero, signifying there is little difference in their relationships with bar passage.
+
+```{r comRegCoef, fig.cap="Log-odds ratios of bar passage between commercial prep courses. Negative values signify that takers of the second listed course have higher odds of bar passage.", fig.width = 6, fig.height = 3.5}
+# plot of coefficient values--------------------
+
+mods_coef_posterior %>%
+  class_coeff_plot( "Bar Pass Log-Odds Ratios of Comm. Prep Courses", 
+                    "Log-odds ratio of bar passage /\nLogistic Regression Coefficients", 
+                    NULL,
+                    as.vector(recode_names), x_limit = NULL, horz_line = 0) +
+    facet_wrap(~jur, ncol = 1)
+
+```
+
+Table \@ref(tab:comProbAboveZero) lists the probability that the values in figure \@ref(fig:comRegCoef) are less than zero. This is the probability that takers of the second listed course have higher odds of bar passage than takers of the first listed course. At 99% for both Kaplan comparisons and each jurisdiction, we have a high degree of confidence that Kaplan takers have lower odds of bar passage, even when accounting for LGPA, graduating class, and bar jurisdiction. Conversely, the Themis versus Barbri percentages for all states and NC only are close enough to 50% to create doubt on which course has the higher odds of bar passage.
+
+```{r comProbAboveZero}
+table_colnames <- c('Comparison', jurs)
+
+# find percentage above zero for all states and for NC only
+map_df(jurs, function(x) {
+     mods_coef_posterior %>%
+      filter(jur == !!x) %>%
+      post_point_prob(class_name, expr(estimate < 0), T) %>%
+      mutate(jurisdiction = !!x)
+}) %>%
+  pivot_wider(names_from = 'jurisdiction', values_from = 'exceed_threshold') %>%
+  kable(col.names = table_colnames, longtable = T, booktabs = T,  linesep = "",
+        caption = "Probability that the log-odds ratio is less than zero. Signifies the probability that students taking the course listed on the left side have a higher odds of bar passage than those taking the course on the right side, accounting for bar passage predictors.")
+```
+
+### Predicted bar passage based on commercial prep company 
+
+```{r}
+# create predictions from model -----------
+
+# create dataset for predictions
+pred_posterior <- df_mod %>%
+  data_grid(
+    cum_gpa_ctr = seq(-1, 1, by = .1),
+    prep_co = prep_co
+  ) %>%
+    mutate(class = "2019",
+           jur = "NC_ube") %>%
+  # add posterior predictions to dataset from NC only model
+  add_fitted_draws(mods[[1]], n = 300, seed = 342)
+
+# calcualte difference and 90% credible interval of difference b/t predictions of Kaplan and Themis
+
+# get index number that is closest to 0 (mean)
+i <- which.min(abs(pred_posterior$cum_gpa_ctr))
+
+# filter on this percent rank, as it is the closest to mean
+perc_rank_keep <- pred_posterior$cum_gpa_ctr[i]
+
+pred_diff <- pred_posterior %>%
+  filter(prep_co %in% c("Kaplan", "Barbri"),
+         cum_gpa_ctr == !!perc_rank_keep) %>%
+  ungroup() %>%
+  select(prep_co, .row, .draw, .value) %>%
+  pivot_wider(id_cols = ".draw", names_from = "prep_co", values_from = ".value") %>%
+  mutate(diff = Barbri - Kaplan) %>%
+  median_hdi(diff, .width = .9) %>%
+  select(diff:.upper) %>%
+  mutate_all(~round(.*100), 0)
+```
+
+Using the NC only model from step two, figure \@ref(fig:comPredictedPass) shows predicted bar passage rates for Feb. 2020 bar exam takers in North Carolina. The predictions are separated by commercial prep course. It reiterates that Kaplan students, taking the same test and having the same class rank, have a lower predicted probability of bar passage compared to Themis and Barbri students. Themis and Barbri, however, have almost identical predicted bar passage rates. The rates and their credible intervals are so similar that they are difficult to distinguish from the plot because Themis overlays Barbri.
+
+```{r comPredictedPass, fig.cap = "Average predicted bar passage for each commercial prep course. Themis overlays Barbri, making it difficult to distinguish Barbri from Themis.", fig.width = 3.5, fig.height = 3.5}
+pred_posterior %>%
+  # calculate hdi of predictions
+  median_hdi(.value, .width = .9) %>%
+  mutate(perc_rank = round(pnorm(cum_gpa_ctr, 0, 1), 3)) %>%
+  # plot predictions
+  plot_predictions(x_var = perc_rank, class_name = prep_co, x_axis_limit = c(.2, .8),
+                 plot_title = "Feb. 2020 NC Bar Pass Probabilities", 
+                 x_lab = "Law School Class Percentile Rank", y_lab = "Bar Passage Probability", use_perc = T)
+```
+
+Zeroing in on students at the 50th percentile of class rank, those taking Barbri have a `r pred_diff$diff[1]` percentage point higher predicted probability of bar passage compared to those taking Kaplan, with the 90% credible interval of this difference spanning `r pred_diff$.lower[1]` to `r pred_diff$.upper[1]` percentage points. This further highlights how Kaplan students perform worse on the bar exam, accounting for class rank, graduating class, and bar jurisdiction. 
+
+## Conclusion
+
+Both the raw data and the modeled results show that students taking Kaplan perform worse on the bar exam than comparative students taking Barbri or Themis. This holds when producing an average across all states and when focusing only on NC bar exam takers. The difference between Themis and Barbri, however, is too close to state any firm conclusions.
